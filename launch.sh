@@ -12,6 +12,12 @@ TAP_DEV="tap${ID}"
 MAC_ADDR=$(printf "AA:FC:00:00:00:%02X" $ID)
 SOCK="/tmp/firecracker-${ID}.socket"
 
+if [ ! -f "$KERNEL" ]; then
+  echo "❌ [ERROR] Kernel not found at: $KERNEL"
+  echo "   Please check the path or compile it first."
+  exit 1
+fi
+
 # --- PRE-FLIGHT ---
 # 1. Create Private Disk
 if [ ! -f "$VM_IMAGE" ]; then
