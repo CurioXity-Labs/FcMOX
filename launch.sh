@@ -63,7 +63,7 @@ while true; do
   configure_vm &
 
   # Run Firecracker in FOREGROUND (so you can type)
-  firecracker --api-sock "$SOCK"
+  ./firecracker --api-sock "$SOCK"
 
   # If we get here, Firecracker exited
   echo "🛑 [VM $ID] Process exited."
