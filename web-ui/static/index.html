@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FireAdmin — MicroVM Control Plane</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --text: #e6edf3; --dim: #7d8590; --accent: #58a6ff;
+    --green: #3fb950; --red: #f85149; --yellow: #d29922; --blue: #58a6ff;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 13px; }
+
+  /* Layout */
+  #app { display: flex; flex-direction: column; height: 100vh; }
+  header { display: flex; align-items: center; gap: 16px; padding: 12px 20px; background: var(--surface); border-bottom: 1px solid var(--border); }
+  header h1 { font-size: 16px; font-weight: 600; color: var(--accent); }
+  header h1 span { color: var(--dim); font-weight: 400; }
+
+  .main { display: flex; flex: 1; overflow: hidden; }
+  .sidebar { width: 320px; min-width: 280px; background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow-y: auto; }
+  .console-area { flex: 1; display: flex; flex-direction: column; background: #000; }
+
+  /* Sidebar */
+  .toolbar { padding: 12px; border-bottom: 1px solid var(--border); display: flex; gap: 8px; align-items: center; }
+  .toolbar input { flex: 1; background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 6px 10px; border-radius: 4px; font-family: inherit; font-size: 12px; width: 50px; }
+  .toolbar select { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 6px 8px; border-radius: 4px; font-family: inherit; font-size: 12px; }
+
+  .btn { padding: 6px 12px; border: 1px solid var(--border); background: var(--surface); color: var(--text); border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 12px; transition: all .15s; }
+  .btn:hover { border-color: var(--accent); color: var(--accent); }
+  .btn-primary { background: var(--accent); color: #000; border-color: var(--accent); font-weight: 600; }
+  .btn-primary:hover { opacity: 0.85; }
+  .btn-sm { padding: 3px 8px; font-size: 11px; }
+  .btn-danger { color: var(--red); border-color: var(--red); }
+  .btn-danger:hover { background: var(--red); color: #fff; }
+
+  .vm-list { flex: 1; overflow-y: auto; }
+  .vm-card { padding: 10px 12px; border-bottom: 1px solid var(--border); cursor: pointer; transition: background .1s; }
+  .vm-card:hover { background: rgba(88, 166, 255, 0.06); }
+  .vm-card.active { background: rgba(88, 166, 255, 0.1); border-left: 3px solid var(--accent); }
+  .vm-card .vm-header { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+  .vm-card .vm-name { font-weight: 600; font-size: 13px; }
+  .vm-card .vm-meta { color: var(--dim); font-size: 11px; }
+  .vm-card .vm-actions { display: flex; gap: 4px; margin-top: 6px; }
+
+  .badge { display: inline-block; padding: 1px 6px; border-radius: 10px; font-size: 10px; font-weight: 600; text-transform: uppercase; }
+  .badge-running { background: rgba(63, 185, 80, 0.15); color: var(--green); }
+  .badge-stopped { background: rgba(125, 133, 144, 0.15); color: var(--dim); }
+  .badge-starting { background: rgba(210, 153, 34, 0.15); color: var(--yellow); }
+  .badge-stopping { background: rgba(248, 81, 73, 0.15); color: var(--red); }
+
+  /* Console */
+  .console-tabs { display: flex; background: var(--surface); border-bottom: 1px solid var(--border); min-height: 36px; align-items: center; padding: 0 8px; }
+  .console-tab { padding: 6px 14px; color: var(--dim); cursor: pointer; border-bottom: 2px solid transparent; font-size: 12px; }
+  .console-tab.active { color: var(--text); border-bottom-color: var(--accent); }
+  .console-tab .close { margin-left: 6px; color: var(--dim); cursor: pointer; }
+  .console-tab .close:hover { color: var(--red); }
+  .console-placeholder { flex: 1; display: flex; align-items: center; justify-content: center; color: var(--dim); font-size: 14px; }
+  #terminal-container { flex: 1; padding: 4px; display: flex; flex-direction: column; overflow: hidden; }
+
+  /* Split layout */
+  .split-wrapper { flex: 1; display: flex; overflow: hidden; }
+  .split-wrapper.vertical { flex-direction: column; }
+  .split-wrapper.horizontal { flex-direction: row; }
+  .split-pane { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; position: relative; }
+  .split-pane + .split-pane { border-left: 2px solid var(--border); }
+  .split-wrapper.vertical .split-pane + .split-pane { border-left: none; border-top: 2px solid var(--border); }
+  .split-pane .pane-header { display: flex; align-items: center; justify-content: space-between; padding: 2px 10px; background: var(--surface); border-bottom: 1px solid var(--border); font-size: 11px; color: var(--dim); flex-shrink: 0; }
+  .split-pane .pane-header .pane-title { font-weight: 600; color: var(--text); }
+  .split-pane .pane-terminal { flex: 1; padding: 2px; overflow: hidden; }
+  .split-pane .pane-header .pane-actions { display: flex; gap: 6px; }
+  .split-pane .pane-header .pane-close { cursor: pointer; color: var(--dim); }
+  .split-pane .pane-header .pane-close:hover { color: var(--red); }
+
+  /* Layout control in tab bar */
+  .layout-controls { margin-left: auto; display: flex; gap: 4px; align-items: center; }
+  .layout-controls .btn-icon { padding: 3px 7px; font-size: 13px; line-height: 1; border: 1px solid var(--border); background: transparent; color: var(--dim); border-radius: 3px; cursor: pointer; }
+  .layout-controls .btn-icon:hover { color: var(--accent); border-color: var(--accent); }
+  .layout-controls .btn-icon.active { color: var(--accent); border-color: var(--accent); background: rgba(88,166,255,0.1); }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>FireAdmin <span>/ MicroVM Control Plane</span></h1>
+  </header>
+  <div class="main">
+    <div class="sidebar">
+      <div class="toolbar">
+        <input id="vm-id" type="number" min="1" max="254" placeholder="ID" value="1">
+        <select id="vm-cpu"><option value="1">1 CPU</option><option value="2" selected>2 CPU</option><option value="4">4 CPU</option></select>
+        <select id="vm-mem"><option value="512">512M</option><option value="1024" selected>1G</option><option value="2048">2G</option></select>
+        <button class="btn btn-primary" onclick="createVM()">＋ Create</button>
+      </div>
+      <div id="vm-list" class="vm-list"></div>
+    </div>
+    <div class="console-area">
+      <div id="console-tabs" class="console-tabs"></div>
+      <div id="terminal-container" class="console-placeholder">Select a running VM to attach console</div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/lib/addon-web-links.min.js"></script>
+<script>
+const API = '/api/vms';
+
+// --- Layout state ---
+let layoutMode = 'single';  // 'single' | 'split-h' | 'split-v'
+let focusedPane = 0;
+
+// Each pane owns its own terminal + websocket (independent lifecycle).
+// paneState[0] and paneState[1] hold { vmId, term, ws, fitAddon } or null.
+let paneState = [null, null];
+
+// --- API helpers ---
+async function api(method, path, body) {
+  const opts = { method, headers: { 'Content-Type': 'application/json' } };
+  if (body) opts.body = JSON.stringify(body);
+  const resp = await fetch(path, opts);
+  if (resp.status === 204) return null;
+  return resp.json();
+}
+
+// --- VM CRUD ---
+async function createVM() {
+  const id = parseInt(document.getElementById('vm-id').value);
+  const vcpus = parseInt(document.getElementById('vm-cpu').value);
+  const mem_mib = parseInt(document.getElementById('vm-mem').value);
+  await api('POST', API, { id, vcpus, mem_mib });
+  document.getElementById('vm-id').value = id + 1;
+  refreshList();
+}
+async function startVM(id) {
+  await api('POST', `${API}/${id}/start`);
+  refreshList();
+  setTimeout(() => attachToPane(id, focusedPane), 1500);
+}
+async function stopVM(id) {
+  await api('POST', `${API}/${id}/stop`);
+  refreshList();
+}
+async function destroyVM(id) {
+  if (!confirm(`Destroy VM ${id}? This removes the rootfs.`)) return;
+  // Close from any pane that has it
+  for (let i = 0; i < 2; i++) {
+    if (paneState[i] && paneState[i].vmId === id) teardownPane(i);
+  }
+  await api('DELETE', `${API}/${id}`);
+  refreshList();
+}
+
+// --- VM List ---
+async function refreshList() {
+  const vms = await api('GET', API);
+  const list = document.getElementById('vm-list');
+  if (!vms || vms.length === 0) {
+    list.innerHTML = '<div style="padding:20px;color:var(--dim);text-align:center;">No VMs. Create one above.</div>';
+    return;
+  }
+  const visibleIds = paneState.filter(p => p).map(p => p.vmId);
+  list.innerHTML = vms.sort((a, b) => a.id - b.id).map(vm => `
+    <div class="vm-card ${visibleIds.includes(vm.id) ? 'active' : ''}" onclick="attachToPane(${vm.id}, ${focusedPane})">
+      <div class="vm-header">
+        <span class="vm-name">VM ${vm.id}</span>
+        <span class="badge badge-${vm.state}">${vm.state}</span>
+      </div>
+      <div class="vm-meta">${vm.ip} · ${vm.vcpus} vCPU · ${vm.mem_mib}MB · ${vm.mac}</div>
+      <div class="vm-actions">
+        ${vm.state === 'stopped' ? `<button class="btn btn-sm" onclick="event.stopPropagation(); startVM(${vm.id})">▶ Start</button>` : ''}
+        ${vm.state === 'running' ? `<button class="btn btn-sm" onclick="event.stopPropagation(); stopVM(${vm.id})">■ Stop</button>` : ''}
+        ${vm.state === 'stopped' ? `<button class="btn btn-sm btn-danger" onclick="event.stopPropagation(); destroyVM(${vm.id})">✕ Destroy</button>` : ''}
+        ${vm.state === 'running' && layoutMode !== 'single' ? `<button class="btn btn-sm" onclick="event.stopPropagation(); attachToPane(${vm.id}, 1)" title="Open in right/bottom pane">⇥ Pane 2</button>` : ''}
+      </div>
+    </div>
+  `).join('');
+}
+
+// ─── Pane terminal lifecycle ──────────────────────────────────────────
+// Creates a brand-new Terminal + WebSocket, bound to a specific DOM element.
+// Each pane is fully independent — the backend Console fans out to all WS clients.
+function createPaneSession(vmId, domElement) {
+  const term = new window.Terminal({
+    cursorBlink: true, fontSize: 13,
+    fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
+    theme: { background: '#0d1117', foreground: '#e6edf3', cursor: '#58a6ff', selectionBackground: '#264f78' },
+    scrollback: 10000,
+  });
+  const fitAddon = new window.FitAddon.FitAddon();
+  term.loadAddon(fitAddon);
+  term.loadAddon(new window.WebLinksAddon.WebLinksAddon());
+
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  // Use SSH for independent sessions (each pane gets its own shell)
+  const ws = new WebSocket(`${proto}://${location.host}/ws/ssh/${vmId}`);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen  = () => term.write('\r\n\x1b[90m--- SSH session to VM ' + vmId + ' ---\x1b[0m\r\n');
+  ws.onmessage = (e) => term.write(new Uint8Array(e.data));
+  ws.onclose = () => term.write('\r\n\x1b[31m--- Disconnected ---\x1b[0m\r\n');
+  ws.onerror = () => term.write('\r\n\x1b[31m--- Connection error ---\x1b[0m\r\n');
+  term.onData(data => { if (ws.readyState === WebSocket.OPEN) ws.send(data); });
+
+  term.open(domElement);
+  fitAddon.fit();
+
+  return { vmId, term, ws, fitAddon };
+}
+
+// Completely destroys a pane's terminal session.
+function teardownPane(idx) {
+  const s = paneState[idx];
+  if (!s) return;
+  s.ws.close();
+  s.term.dispose();
+  paneState[idx] = null;
+}
+
+// ─── Attach / detach ──────────────────────────────────────────────────
+function attachToPane(vmId, paneIdx) {
+  // In single mode always use pane 0
+  if (layoutMode === 'single') paneIdx = 0;
+  focusedPane = paneIdx;
+  // Tear down whatever was in this pane before
+  teardownPane(paneIdx);
+  // Mark it, then render (render creates the DOM, then we attach the terminal)
+  paneState[paneIdx] = { vmId, term: null, ws: null, fitAddon: null };
+  renderLayout();
+  refreshList();
+}
+
+function closePaneConsole(idx) {
+  teardownPane(idx);
+  if (paneState[0] === null && paneState[1] === null) focusedPane = 0;
+  else if (paneState[focusedPane] === null) focusedPane = paneState[0] ? 0 : 1;
+  renderLayout();
+  refreshList();
+}
+
+// ─── Layout switching ──────────────────────────────────────────────────
+function setLayout(mode) {
+  const prev = layoutMode;
+  layoutMode = mode;
+  if (mode === 'single' && prev !== 'single') {
+    // Keep focused pane, teardown the other
+    const keepIdx = focusedPane;
+    const dropIdx = 1 - keepIdx;
+    teardownPane(dropIdx);
+    if (keepIdx === 1 && paneState[1]) {
+      // Move pane 1 data to slot 0
+      paneState[0] = paneState[1];
+      paneState[1] = null;
+    }
+    focusedPane = 0;
+  }
+  // Tear down all existing sessions — renderLayout will recreate them
+  // (needed because DOM structure changes)
+  const saved = [
+    paneState[0] ? paneState[0].vmId : null,
+    paneState[1] ? paneState[1].vmId : null,
+  ];
+  teardownPane(0);
+  teardownPane(1);
+  paneState[0] = saved[0] !== null ? { vmId: saved[0] } : null;
+  paneState[1] = saved[1] !== null ? { vmId: saved[1] } : null;
+  renderLayout();
+  refreshList();
+}
+
+// ─── Render ────────────────────────────────────────────────────────────
+function renderLayout() {
+  const container = document.getElementById('terminal-container');
+  const anyActive = paneState[0] || paneState[1];
+
+  // Tab bar
+  renderTabs();
+
+  if (!anyActive) {
+    container.className = 'console-placeholder';
+    container.innerHTML = 'Select a running VM to attach console';
+    return;
+  }
+
+  container.className = '';
+  container.innerHTML = '';
+
+  if (layoutMode === 'single') {
+    // Single pane — fill the entire container
+    const ps = paneState[0];
+    if (!ps) { container.className = 'console-placeholder'; container.textContent = 'Select a running VM'; return; }
+    const termDiv = document.createElement('div');
+    termDiv.style.cssText = 'flex:1;width:100%;height:100%;';
+    container.appendChild(termDiv);
+    const session = createPaneSession(ps.vmId, termDiv);
+    paneState[0] = session;
+    session.term.focus();
+    return;
+  }
+
+  // Split mode
+  const dir = layoutMode === 'split-v' ? 'vertical' : 'horizontal';
+  const wrapper = document.createElement('div');
+  wrapper.className = `split-wrapper ${dir}`;
+  wrapper.style.cssText = 'flex:1;display:flex;width:100%;height:100%;';
+  container.appendChild(wrapper);
+
+  for (let i = 0; i < 2; i++) {
+    const pane = document.createElement('div');
+    pane.className = 'split-pane';
+    pane.onclick = () => { focusedPane = i; renderTabs(); };
+
+    const hdr = document.createElement('div');
+    hdr.className = 'pane-header';
+
+    const ps = paneState[i];
+    if (ps && ps.vmId !== undefined) {
+      hdr.innerHTML = `<span class="pane-title">VM ${ps.vmId}</span>
+        <div class="pane-actions"><span class="pane-close" onclick="event.stopPropagation(); closePaneConsole(${i})" title="Close">✕</span></div>`;
+      pane.appendChild(hdr);
+
+      const termDiv = document.createElement('div');
+      termDiv.className = 'pane-terminal';
+      pane.appendChild(termDiv);
+      wrapper.appendChild(pane);
+
+      // Create session after DOM is attached
+      requestAnimationFrame(() => {
+        const session = createPaneSession(ps.vmId, termDiv);
+        paneState[i] = session;
+        if (i === focusedPane) session.term.focus();
+      });
+    } else {
+      hdr.innerHTML = `<span style="color:var(--dim)">Pane ${i+1} — click a VM</span>`;
+      pane.appendChild(hdr);
+      const ph = document.createElement('div');
+      ph.className = 'console-placeholder';
+      ph.textContent = 'Empty';
+      pane.appendChild(ph);
+      wrapper.appendChild(pane);
+    }
+  }
+}
+
+function renderTabs() {
+  const tabsEl = document.getElementById('console-tabs');
+  const vmIds = paneState.filter(p => p).map(p => p.vmId);
+  const uniqueIds = [...new Set(vmIds)].sort((a,b) => a - b);
+
+  let html = uniqueIds.map(id => {
+    const inPane = [];
+    if (paneState[0] && paneState[0].vmId === id) inPane.push(1);
+    if (paneState[1] && paneState[1].vmId === id) inPane.push(2);
+    const label = layoutMode !== 'single' && inPane.length ? `VM ${id} [P${inPane.join('+')}]` : `VM ${id}`;
+    return `<div class="console-tab active" onclick="attachToPane(${id}, ${focusedPane})">
+      ${label}
+      <span class="close" onclick="event.stopPropagation(); closeVmFromAll(${id})">✕</span>
+    </div>`;
+  }).join('');
+
+  html += `<div class="layout-controls">
+    <button class="btn-icon ${layoutMode === 'single' ? 'active' : ''}" onclick="setLayout('single')" title="Single pane">▣</button>
+    <button class="btn-icon ${layoutMode === 'split-h' ? 'active' : ''}" onclick="setLayout('split-h')" title="Split left / right">◫</button>
+    <button class="btn-icon ${layoutMode === 'split-v' ? 'active' : ''}" onclick="setLayout('split-v')" title="Split top / bottom">⬒</button>
+  </div>`;
+
+  tabsEl.innerHTML = html;
+}
+
+function closeVmFromAll(vmId) {
+  for (let i = 0; i < 2; i++) {
+    if (paneState[i] && paneState[i].vmId === vmId) teardownPane(i);
+  }
+  if (!paneState[0] && !paneState[1]) focusedPane = 0;
+  renderLayout();
+  refreshList();
+}
+
+// Handle resize
+window.addEventListener('resize', () => {
+  for (let i = 0; i < 2; i++) {
+    if (paneState[i] && paneState[i].fitAddon) paneState[i].fitAddon.fit();
+  }
+});
+
+// Init
+renderTabs();
+refreshList();
+setInterval(refreshList, 3000);
+</script>
+</body>
+</html>

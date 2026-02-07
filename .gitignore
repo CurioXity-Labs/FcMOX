@@ -1,2 +1,5 @@
 *.config
 *.ext4
+vmlinux-*
+!*.xz
+
