@@ -3,14 +3,15 @@
 
 # --- CONFIGURATION ---
 ID=${1:-1}
-VM_MEM="1024"
-VM_CPU="2"
-KERNEL="./lk-images/vmlinux-6.12-ebpf" # Adjusted to match your output
-MASTER_IMAGE="./lk-rootfs/rootfs.ext4" # Adjusted to match your previous context
+VM_MEM="12200"
+VM_CPU="20"
+KERNEL="./lk-images/vmlinux-ebpf-6.11" # Adjusted to match your output
+MASTER_IMAGE="./lk-rootfs/debian.ext4" # Alpine rootfs built by build-rootfs.sh
 VM_IMAGE="rootfs-vm${ID}.ext4"
 TAP_DEV="tap${ID}"
 MAC_ADDR=$(printf "AA:FC:00:00:00:%02X" $ID)
 SOCK="/tmp/firecracker-${ID}.socket"
+IP="172.16.0.$((ID + 10))"
 
 if [ ! -f "$KERNEL" ]; then
   echo "❌ [ERROR] Kernel not found at: $KERNEL"
@@ -44,7 +45,7 @@ configure_vm() {
 
   # 3. Kernel
   curl --unix-socket "$SOCK" -X PUT 'http://localhost/boot-source' \
-    -d "{ \"kernel_image_path\": \"$(pwd)/$KERNEL\", \"boot_args\": \"console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/sbin/init systemd.unit=multi-user.target\" }" >/dev/null 2>&1
+    -d "{ \"kernel_image_path\": \"$(pwd)/$KERNEL\", \"boot_args\": \"console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/sbin/firecracker-init quiet lpj=4000000 fc_ip=$IP\" }" >/dev/null 2>&1
 
   # 4. Network
   curl --unix-socket "$SOCK" -X PUT 'http://localhost/network-interfaces/eth0' \

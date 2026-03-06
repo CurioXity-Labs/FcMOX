@@ -6,11 +6,11 @@ set -euo pipefail
 # Leave empty if you don't want to copy modules (eBPF might break)
 KERNEL_SRC="../linux.git"
 
-ROOTFS_SIZE_GB=2
+ROOTFS_SIZE_MB=4096
 ROOTFS_IMAGE="rootfs.ext4"
 BUILD_DIR=".firecracker-build-$(date +%s)"
 MOUNT_POINT="${BUILD_DIR}/mount"
-DOCKER_IMAGE_NAME="fc-research-builder"
+DOCKER_IMAGE_NAME="fc-alpine-builder"
 
 # --- SETUP ---
 mkdir -p "${BUILD_DIR}"
@@ -22,99 +22,123 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# --- STEP 1: DEFINE THE OS (Docker) ---
+# --- STEP 1: DEFINE THE OS (Alpine Docker) ---
 cat >"${BUILD_DIR}/Dockerfile" <<'EOF'
-FROM ubuntu:24.04
-ENV DEBIAN_FRONTEND=noninteractive
+FROM alpine:3.21
 
-# 1. Install Core Dependencies
-RUN apt-get update && apt-get install -y \
-    bash-completion \
-    build-essential \
-    ca-certificates \
+# 1. Install Core Dependencies (minimal)
+RUN apk add --no-cache \
+    busybox-extras \
     curl \
-    git \
     htop \
     iproute2 \
-    iputils-ping \
-    kmod \
-    nano \
-    net-tools \
     openssh-server \
-    sudo \
-    systemd \
-    systemd-sysv \
-    udev \
-    vim \
-    wget \
-    zstd
+    shadow \
+    util-linux \
+    zsh \
+    bpftool
 
-# 2. Install eBPF & Research Tools
-RUN apt-get install -y \
-    bpfcc-tools \
-    bpftrace \
-    clang \
-    gcc \
-    libbpf-dev \
-    libelf-dev \
-    llvm \
-    make \
-    pkg-config \
-    python3 \
-    python3-pip \
-    tcpdump
+# 2. Install Go (latest from golang.org)
+RUN curl -fsSL https://go.dev/dl/go1.24.1.linux-amd64.tar.gz | tar -C /usr/local -xz
+ENV PATH="/usr/local/go/bin:${PATH}"
+ENV GOPATH="/root/go"
+
+RUN printf '======================================\n  Firecracker microVM (Alpine)\n  SSH: root@<IP>\n  Password: root\n======================================\n' > /etc/motd
 
 # 3. Configure SSH (Permit Root)
 RUN mkdir -p /var/run/sshd && \
     echo 'root:root' | chpasswd && \
-    sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
-
-# 4. Setup Serial Console (Crucial for Firecracker)
-RUN systemctl enable serial-getty@ttyS0.service
-
-# 5. Create the "Magic Network" Script
-# This script reads the MAC address and sets the IP automatically
-RUN echo '#!/bin/bash\n\
-MAC=$(cat /sys/class/net/eth0/address)\n\
-ID=${MAC##*:}\n\
-# Convert hex ID to decimal if needed, or just append\n\
-# Mapping: :01 -> .11, :02 -> .12, :03 -> .13\n\
-if [ "$ID" == "01" ]; then SUFFIX="11"; fi\n\
-if [ "$ID" == "02" ]; then SUFFIX="12"; fi\n\
-if [ "$ID" == "03" ]; then SUFFIX="13"; fi\n\
-\n\
-if [ -z "$SUFFIX" ]; then SUFFIX="14"; fi\n\
-\n\
-IP="172.16.0.$SUFFIX"\n\
-echo "Configuring Network: MAC=$MAC -> IP=$IP"\n\
-ip addr add $IP/24 dev eth0\n\
-ip link set eth0 up\n\
-ip route add default via 172.16.0.1\n\
-echo "nameserver 8.8.8.8" > /etc/resolv.conf\n\
-' > /usr/local/bin/fc-net-setup.sh && chmod +x /usr/local/bin/fc-net-setup.sh
-
-# 6. Create Systemd Service for Network
-RUN echo '[Unit]\n\
-Description=Firecracker Magic Network\n\
-After=network.target\n\
-\n\
-[Service]\n\
-Type=oneshot\n\
-ExecStart=/usr/local/bin/fc-net-setup.sh\n\
-RemainAfterExit=yes\n\
-\n\
-[Install]\n\
-WantedBy=multi-user.target\n\
-' > /etc/systemd/system/fc-net.service && systemctl enable fc-net.service
+    sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config && \
+    ssh-keygen -A
 
 EOF
 
+# --- STEP 1b: CREATE CUSTOM INIT SCRIPT ---
+cat >"${BUILD_DIR}/init" <<'INITEOF'
+#!/bin/sh
+# Custom init for Firecracker microVMs (Alpine)
+
+# Go environment
+export PATH="/usr/local/go/bin:/root/go/bin:$PATH"
+export GOPATH="/root/go"
+
+# 1. Mount essential filesystems
+mount -t proc     proc     /proc
+mount -t sysfs    sysfs    /sys
+mount -t debugfs  debugfs  /sys/kernel/debug 2>/dev/null || true
+mount -t tmpfs    tmpfs    /tmp
+mount -t tmpfs    tmpfs    /run
+
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts
+
+# Remount root as read-write
+mount -o remount,rw /
+
+# 2. Set hostname
+hostname firecracker
+
+# 3. Configure Network
+# Reads fc_ip= from kernel cmdline (set by orchestrator), falls back to MAC derivation
+FC_IP=$(sed -n 's/.*fc_ip=\([^ ]*\).*/\1/p' /proc/cmdline)
+
+if [ -n "$FC_IP" ]; then
+  IP="$FC_IP"
+  echo "[init] Network: fc_ip=$IP (from kernel cmdline)"
+else
+  # Wait briefly for eth0 to appear
+  for i in $(seq 1 10); do
+    [ -e /sys/class/net/eth0/address ] && break
+    sleep 0.1
+  done
+
+  if [ -e /sys/class/net/eth0/address ]; then
+    MAC=$(cat /sys/class/net/eth0/address)
+    HEX_ID=${MAC##*:}
+    DECIMAL_ID=$(printf "%d" "0x$HEX_ID")
+    SUFFIX=$((DECIMAL_ID + 10))
+    IP="172.16.0.$SUFFIX"
+    echo "[init] Network: MAC=$MAC -> ID=$DECIMAL_ID -> IP=$IP (fallback)"
+  else
+    echo "[init] WARNING: eth0 not found, skipping network config"
+    IP=""
+  fi
+fi
+
+if [ -n "$IP" ]; then
+  ip addr add "$IP/24" dev eth0
+  ip link set eth0 up
+  ip route add default via 172.16.0.1
+  echo "nameserver 8.8.8.8" > /etc/resolv.conf
+fi
+
+# 4. Start SSH daemon
+mkdir -p /var/empty
+chown root:root /var/empty
+chmod 755 /var/empty
+/usr/sbin/sshd
+
+# 5. Print banner
+echo ""
+echo "======================================"
+echo "  Firecracker microVM (Alpine)"
+echo "  IP: ${IP:-N/A}"
+echo "  SSH: root@${IP}"
+echo "  Password: root"
+echo "======================================"
+echo ""
+
+# 6. Drop to login shell on serial console
+sleep infinity
+INITEOF
+
+chmod +x "${BUILD_DIR}/init"
 # --- STEP 2: BUILD & EXPORT ---
 echo -e "\033[0;32m[INFO]\033[0m Building Docker Image..."
 docker build -t "${DOCKER_IMAGE_NAME}" -f "${BUILD_DIR}/Dockerfile" "${BUILD_DIR}"
 
-echo -e "\033[0;32m[INFO]\033[0m Creating Disk Image (${ROOTFS_SIZE_GB}GB)..."
-dd if=/dev/zero of="${ROOTFS_IMAGE}" bs=1M count=0 seek=$((ROOTFS_SIZE_GB * 1024))
+echo -e "\033[0;32m[INFO]\033[0m Creating Disk Image (${ROOTFS_SIZE_MB}MB)..."
+dd if=/dev/zero of="${ROOTFS_IMAGE}" bs=1M count=0 seek=${ROOTFS_SIZE_MB}
 mkfs.ext4 -F "${ROOTFS_IMAGE}"
 
 echo -e "\033[0;32m[INFO]\033[0m Exporting Filesystem..."
@@ -122,7 +146,7 @@ CONTAINER_ID=$(docker create "${DOCKER_IMAGE_NAME}")
 docker export "${CONTAINER_ID}" | tar -xf - -C "${BUILD_DIR}"
 docker rm "${CONTAINER_ID}"
 
-# --- STEP 3: INJECT KERNEL MODULES & CONFIG ---
+# --- STEP 3: INJECT INIT, KERNEL MODULES & CONFIG ---
 echo -e "\033[0;32m[INFO]\033[0m Mounting & Configuring..."
 mkdir -p "${MOUNT_POINT}"
 sudo mount "${ROOTFS_IMAGE}" "${MOUNT_POINT}"
@@ -130,10 +154,13 @@ sudo mount "${ROOTFS_IMAGE}" "${MOUNT_POINT}"
 # A. Copy Docker contents to Disk Image
 sudo cp -a "${BUILD_DIR}"/* "${MOUNT_POINT}/" 2>/dev/null || true
 
-# B. INSTALL KERNEL MODULES (Crucial for eBPF)
+# B. Install custom init script
+sudo cp "${BUILD_DIR}/init" "${MOUNT_POINT}/sbin/init"
+sudo chmod +x "${MOUNT_POINT}/sbin/init"
+
+# C. INSTALL KERNEL MODULES (Crucial for eBPF)
 if [ -d "$KERNEL_SRC" ]; then
   echo -e "\033[0;32m[INFO]\033[0m Installing Kernel Modules from ${KERNEL_SRC}..."
-  # We run make modules_install pointing to the MOUNT POINT
   cd "$KERNEL_SRC"
   sudo make modules_install INSTALL_MOD_PATH="$(readlink -f ${OLDPWD}/${MOUNT_POINT})"
   cd - >/dev/null
@@ -142,27 +169,27 @@ else
   echo "      eBPF programs may fail if they depend on specific kernel headers/modules."
 fi
 
-# C. CREATE /etc/fstab (Fixes 'Read-Only' issues)
+# D. CREATE /etc/fstab
 echo -e "\033[0;32m[INFO]\033[0m Generating fstab..."
-echo "
+cat <<FSTAB | sudo tee "${MOUNT_POINT}/etc/fstab" >/dev/null
 # <file system> <mount point>   <type>  <options>       <dump>  <pass>
 /dev/vda        /               ext4    defaults        0       1
 proc            /proc           proc    defaults        0       0
 sysfs           /sys            sysfs   defaults        0       0
 debugfs         /sys/kernel/debug debugfs defaults      0       0
 tmpfs           /tmp            tmpfs   defaults        0       0
-" | sudo tee "${MOUNT_POINT}/etc/fstab" >/dev/null
+FSTAB
 
-# D. FIX HOSTNAME & HOSTS (Fixes 'sudo' complaints)
-echo "firecracker" | sudo tee "${MOUNT_POINT}/etc/hostname"
-echo "127.0.0.1 localhost firecracker" | sudo tee "${MOUNT_POINT}/etc/hosts"
+# E. FIX HOSTNAME & HOSTS
+echo "firecracker" | sudo tee "${MOUNT_POINT}/etc/hostname" >/dev/null
+echo "127.0.0.1 localhost firecracker" | sudo tee "${MOUNT_POINT}/etc/hosts" >/dev/null
 
-# E. Generate SSH Host Keys (So sshd starts)
+# F. Generate SSH Host Keys (So sshd starts)
 echo -e "\033[0;32m[INFO]\033[0m Pre-generating SSH Keys..."
 sudo ssh-keygen -A -f "${MOUNT_POINT}"
 
 # --- FINISH ---
 sync
 sudo umount "${MOUNT_POINT}"
-echo -e "\033[0;32m[SUCCESS]\033[0m Rootfs created: ${ROOTFS_IMAGE}"
-echo "Use this ONE image for all your VMs. The Magic Network script will handle IPs."
+echo -e "\033[0;32m[SUCCESS]\033[0m Alpine rootfs created: ${ROOTFS_IMAGE} (${ROOTFS_SIZE_MB}MB)"
+echo "Use this ONE image for all your VMs. The custom init script will handle networking."

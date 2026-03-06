@@ -7,7 +7,7 @@ COUNT=${1:-3} # Default to 3 if no number given
 
 BRIDGE="fc-br0"
 GATEWAY_IP="172.16.0.1"
-INTERNET_IF="wlp2s0" # CHANGE THIS to your actual wifi interface
+INTERNET_IF="enp33s0f0" # CHANGE THIS to your actual wifi interface
 
 echo "--- Setting up Cluster for $COUNT VMs ---"
 
