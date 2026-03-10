@@ -3,8 +3,8 @@
 
 # --- CONFIGURATION ---
 ID=${1:-1}
-VM_MEM="12200"
-VM_CPU="20"
+VM_MEM="2048"
+VM_CPU="2"
 KERNEL="./lk-images/vmlinux-ebpf-6.11" # Adjusted to match your output
 MASTER_IMAGE="./lk-rootfs/debian.ext4" # Alpine rootfs built by build-rootfs.sh
 VM_IMAGE="rootfs-vm${ID}.ext4"

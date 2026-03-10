@@ -1,81 +1,63 @@
 # Firecracker eBPF Research Lab
 
-This repository contains the infrastructure code for deploying a Firecracker MicroVM cluster tailored for eBPF systems research and agentless cloud inventory. It includes custom kernel configurations, rootfs generation scripts, and cluster management tools.
+This repository contains the infrastructure code for deploying a Firecracker MicroVM cluster tailored for eBPF systems research and agentless cloud inventory. It includes custom kernel configurations, rootfs generation scripts, and a full-featured Terminal User Interface (TUI) for cluster management.
 
 ## Prerequisites
 
 * Linux Host with KVM support (`/dev/kvm`)
 * Docker (for building the rootfs)
-* Firecracker binary (v1.0+)
 * `iproute2` and `iptables` (for networking)
+* Go 1.25.7 (to build the TUI manager)
 
-## Directory Structure
+---
 
-* **lk-images/**: Compiled kernel binaries. The primary kernel is `vmlinux-6.12-ebpf`.
-* **lk-rootfs/**: Scripts and artifacts for the guest filesystem.
-* `build-rootfs.sh`: Generates an Ubuntu 24.04 image with pre-installed eBPF tools (bpftool, libbpf, clang).
+## Getting Started
 
+### 1. Bootstrap Kernels & Rootfs
 
-* **net/**: Networking utilities.
-* `setup-cluster-net`: Configures the host bridge (`fc-br0`) and TAP interfaces for the cluster.
+You first need to prepare your kernels (extracting them from `.xz`) and build the Debian root image systems. We have provided an automated bootstrap script to do this for you.
 
-
-* **launch.sh**: The main entry point script to provision and boot specific VM instances.
-
-## Usage
-
-### 1. Network Setup
-
-Initialize the host networking bridge and TAP interfaces. This must be run as root.
-
+Run this from the root of the repository:
 ```bash
-sudo ./net/setup-cluster-net <COUNT>
-
+cd scripts
+./bootstrap.sh
 ```
 
-*Replace `<COUNT>` with the number of VMs you intend to run (default is 3).*
+This will automatically extract the compressed kernels in `lk-images/`, build the Debian testing and eBPF filesystems in `lk-rootfs/`.
 
-### 2. Root Filesystem
+### 2. Network Setup
 
-If the master image (`lk-rootfs/rootfs.ext4`) does not exist, generate it:
-
-```bash
-cd lk-rootfs
-./build-rootfs.sh
-
-```
-
-### 3. Launching Instances
-
-To start a specific VM instance, run the launcher with an ID. The script automatically creates a copy of the master rootfs for persistence (`rootfs-vm{ID}.ext4`).
+Initialize the host networking bridge (`fc-br0`) and TAP interfaces. The script automatically detects your active internet interface and handles the NAT/routing so your VMs have internet access.
 
 ```bash
-./launch.sh 1
-
+sudo ./net/setup-cluster-net
 ```
 
-Open a new terminal session to launch additional nodes:
+### 3. Launching fcmox (TUI VM Manager)
+
+Instead of manually crafting API calls or managing sockets, use the custom `fcmox` Terminal User Interface to manage your Firecracker cluster.
 
 ```bash
-./launch.sh 2
-
+cd fcmox
+go build -o fcmox-bin ./cmd/
+sudo setcap cap_net_admin,cap_net_raw+ep ./fcmox-bin
+./fcmox-bin --rootfs-path=../lk-rootfs --linux-images-path=../lk-images
 ```
+
+## Using the TUI
+
+Once inside `fcmox`, you can:
+* press `c` to Create and boot a new VM via the interactive multi-step wizard.
+* press `p` to Pause a running instance, or `r` to Resume it.
+* press `s` to Start a stopped instance.
+* press `d` to forcefully Delete and destroy a selected VM.
+* press `x` to quickly SSH into the selected VM's root shell.
+* press `l` to view the serial console logs of the boot process for a selected VM.
+
+All instances automatically clone the template rootfs via `cp --reflink=auto` so they have their own independent, writable virtual disks.
 
 ## Access
 
-* **Console:** The launcher attaches directly to the serial console.
 * **Login:** `root` / `root`
-* **Networking:**
-* VM 1 IP: `172.16.0.11`
-* VM 2 IP: `172.16.0.12`
-* Gateway: `172.16.0.1`
-
-
-
-## Configuration
-
-Modify `launch.sh` to adjust the following resource limits:
-
-* `VM_CPU`: Default is 2 vCPUs.
-* `VM_MEM`: Default is 1024 MB.
-* `KERNEL`: Path to the boot kernel (default `lk-images/vmlinux-6.12-ebpf`).
+* **Networking:** IP addresses are generated incrementally starting from `172.16.0.2`.
+* **Gateway:** `172.16.0.1`

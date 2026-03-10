@@ -1,0 +1,37 @@
+#!/bin/bash
+set -e
+
+BRIDGE="fc-br0"
+GATEWAY_IP="172.16.0.1"
+INTERNET_IF=$(ip route show default | awk '/default/ {print $5}')
+if [ -z "$INTERNET_IF" ]; then
+    echo "Error: Could not automatically detect active internet interface."
+    exit 1
+fi
+echo "Using interface: $INTERNET_IF"
+
+echo "--- Setting up Network for VMs ---"
+
+# 1. Cleanup everything first (Reset state)
+echo "Cleaning up old interfaces..."
+ip link delete $BRIDGE 2>/dev/null || true
+# Delete all taps matching tap*
+for tap in $(ip link show | awk -F: '/tap[0-9]+/{print $2}'); do
+    ip link delete $tap 2>/dev/null || true
+done
+
+# 2. Create the Bridge
+echo "Creating Bridge ($BRIDGE)..."
+ip link add name $BRIDGE type bridge
+ip addr add $GATEWAY_IP/24 dev $BRIDGE
+ip link set $BRIDGE up
+
+# 3. NAT / Routing
+echo "Configuring NAT..."
+sysctl -w net.ipv4.ip_forward=1 > /dev/null
+iptables -t nat -D POSTROUTING -o $INTERNET_IF -j MASQUERADE 2>/dev/null || true
+iptables -t nat -A POSTROUTING -o $INTERNET_IF -j MASQUERADE
+iptables -A FORWARD -i $BRIDGE -o $INTERNET_IF -j ACCEPT
+iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+echo "--- Network Ready for VMs ---"

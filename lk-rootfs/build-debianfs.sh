@@ -29,8 +29,10 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # 1. Install Core Dependencies (minimal)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    bpftool \
     ca-certificates \
+    vim \
+    python3 \
+    python3-pip \
     git \
     make \
     curl \
@@ -38,12 +40,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     iproute2 \
     openssh-server \
     procps \
-    util-linux \
-    zsh && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+    util-linux && \
+    apt-get clean
 
 # 2. Install Go (latest from golang.org)
-RUN curl -fsSL https://go.dev/dl/go1.25.1.linux-amd64.tar.gz | tar -C /usr/local -xz
+RUN curl -fsSL https://go.dev/dl/go1.26.1.linux-amd64.tar.gz | tar -C /usr/local -xz
 ENV PATH="/usr/local/go/bin:${PATH}"
 ENV GOPATH="/root/go"
 
@@ -72,7 +73,7 @@ mount -t proc     proc     /proc
 # Boot benchmark — read uptime immediately after /proc is available
 UPTIME=$(cut -d' ' -f1 /proc/uptime)
 echo ""
-echo "⏱️  TTI (Kernel + Init): ${UPTIME}s"
+echo "TTI (Kernel + Init): ${UPTIME}s"
 
 mount -t debugfs  debugfs  /sys/kernel/debug 2>/dev/null || true
 mount -t tmpfs    tmpfs    /tmp
@@ -135,7 +136,6 @@ echo "  Password: root"
 echo "======================================"
 echo ""
 
-# 6. Keep PID 1 alive
 sleep infinity
 INITEOF
 

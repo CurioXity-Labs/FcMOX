@@ -2,8 +2,11 @@ package tui
 
 import (
 	"fmt"
+	"os"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -45,9 +48,10 @@ type action struct {
 
 var actions = []action{
 	{key: "c", name: "Create", desc: "Spin up a new VM", icon: "＋"},
-	{key: "d", name: "Delete", desc: "Remove selected VM", icon: "✕"},
+	{key: "d", name: "Delete", desc: "Remove selected VM", icon: "X"},
 	{key: "s", name: "Start", desc: "Boot selected VM", icon: "▶"},
-	{key: "p", name: "Stop", desc: "Shutdown selected VM", icon: "■"},
+	{key: "p", name: "Pause", desc: "Pause selected VM", icon: "■"},
+	{key: "r", name: "Resume", desc: "Resume selected VM", icon: "▶"},
 	{key: "l", name: "Logs", desc: "Serial console output", icon: "☰"},
 	{key: "x", name: "Shell", desc: "SSH into VM", icon: ">_"},
 }
@@ -72,6 +76,14 @@ const (
 
 // ─── Create Form ─────────────────────────────────────────────────────────────
 
+type createStep int
+
+const (
+	createStepKernel createStep = iota
+	createStepRootfs
+	createStepResources
+)
+
 const (
 	createFieldCpu = iota
 	createFieldMem
@@ -79,6 +91,15 @@ const (
 )
 
 // ─── Model ───────────────────────────────────────────────────────────────────
+
+// tickMsg drives periodic log refresh.
+type tickMsg time.Time
+
+func tickCmd() tea.Cmd {
+	return tea.Tick(time.Second, func(t time.Time) tea.Msg {
+		return tickMsg(t)
+	})
+}
 
 type Model struct {
 	mgr            *vm.VmManager
@@ -91,10 +112,18 @@ type Model struct {
 	message        string
 	messageIsError bool
 
-	// Create form fields
-	createInputs   []textinput.Model
-	createFocusIdx int
-	createError    string
+	// Cached log lines for the selected VM
+	vmLogCache string
+
+	// Create wizard state
+	createStep       createStep
+	createKernelKeys []string // sorted kernel names
+	createRootfsKeys []string // sorted rootfs names
+	createSelKernel  int      // cursor in kernel list
+	createSelRootfs  int      // cursor in rootfs list
+	createInputs     []textinput.Model
+	createFocusIdx   int
+	createError      string
 }
 
 func NewModel(mgr *vm.VmManager) Model {
@@ -123,22 +152,26 @@ func NewModel(mgr *vm.VmManager) Model {
 // ─── Tea Interface ───────────────────────────────────────────────────────────
 
 func (m Model) Init() tea.Cmd {
-	return nil
+	return tickCmd()
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	// Handle window resize in any mode
-	if msg, ok := msg.(tea.WindowSizeMsg); ok {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
 		return m, nil
-	}
 
-	switch m.mode {
-	case modeCreateForm:
-		return m.updateCreateForm(msg)
-	default:
-		if msg, ok := msg.(tea.KeyMsg); ok {
+	case tickMsg:
+		// Refresh the log cache for the selected VM.
+		m.vmLogCache = m.readSelectedVmLogs(20)
+		return m, tickCmd()
+
+	case tea.KeyMsg:
+		switch m.mode {
+		case modeCreateForm:
+			return m.updateCreateForm(msg)
+		default:
 			return m.handleKey(msg)
 		}
 	}
@@ -181,7 +214,6 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.selectedAction++
 			}
 		}
-
 	case "enter":
 		if m.focus == focusActions {
 			return m.executeAction()
@@ -212,61 +244,133 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// ─── Create Form Mode ────────────────────────────────────────────────────────
+// ─── Create Wizard ───────────────────────────────────────────────────────────
 
 func (m Model) enterCreateForm() (Model, tea.Cmd) {
 	m.mode = modeCreateForm
+	m.createStep = createStepKernel
 	m.createError = ""
-	m.createFocusIdx = createFieldCpu
+	m.createSelKernel = 0
+	m.createSelRootfs = 0
 
-	// Reset inputs
+	// Build sorted key lists for selection.
+	m.createKernelKeys = sortedKeys(m.mgr.Kernels)
+	m.createRootfsKeys = sortedKeys(m.mgr.Rootfs)
+
+	// Reset text inputs.
 	for i := range m.createInputs {
 		m.createInputs[i].SetValue("")
 		m.createInputs[i].Blur()
 	}
-	m.createInputs[createFieldCpu].Focus()
 
-	return m, m.createInputs[createFieldCpu].Cursor.BlinkCmd()
+	return m, nil
 }
 
-func (m Model) updateCreateForm(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch msg.String() {
-		case "ctrl+c":
-			return m, tea.Quit
-
-		case "esc":
-			// Cancel create form
+func (m Model) updateCreateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "esc":
+		// Go back one step, or cancel entirely.
+		switch m.createStep {
+		case createStepKernel:
 			m.mode = modeNormal
 			m.message = "Create cancelled"
 			m.messageIsError = false
 			return m, nil
-
-		case "tab", "down":
-			// Move to next field
-			m.createFocusIdx = (m.createFocusIdx + 1) % createFieldCount
-			return m.updateCreateFocus()
-
-		case "shift+tab", "up":
-			// Move to previous field
-			m.createFocusIdx = (m.createFocusIdx - 1 + createFieldCount) % createFieldCount
-			return m.updateCreateFocus()
-
-		case "enter":
-			// If on last field, submit; otherwise advance
-			if m.createFocusIdx == createFieldCount-1 {
-				return m.submitCreateForm()
-			}
-			m.createFocusIdx++
-			return m.updateCreateFocus()
+		case createStepRootfs:
+			m.createStep = createStepKernel
+			m.createError = ""
+			return m, nil
+		case createStepResources:
+			m.createStep = createStepRootfs
+			m.createError = ""
+			return m, nil
 		}
 	}
 
-	// Update the focused text input
-	var cmd tea.Cmd
-	m.createInputs[m.createFocusIdx], cmd = m.createInputs[m.createFocusIdx].Update(msg)
-	return m, cmd
+	switch m.createStep {
+	case createStepKernel:
+		return m.updateKernelSelect(msg)
+	case createStepRootfs:
+		return m.updateRootfsSelect(msg)
+	case createStepResources:
+		return m.updateResourceInputs(msg)
+	}
+	return m, nil
+}
+
+// ── Step 1: Kernel selection ─────────────────────────────────────────────────
+
+func (m Model) updateKernelSelect(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "up", "k":
+		if m.createSelKernel > 0 {
+			m.createSelKernel--
+		}
+	case "down", "j":
+		if m.createSelKernel < len(m.createKernelKeys)-1 {
+			m.createSelKernel++
+		}
+	case "enter":
+		if len(m.createKernelKeys) == 0 {
+			m.createError = "No kernels available"
+			return m, nil
+		}
+		m.createStep = createStepRootfs
+		m.createError = ""
+	}
+	return m, nil
+}
+
+// ── Step 2: Rootfs selection ─────────────────────────────────────────────────
+
+func (m Model) updateRootfsSelect(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "up", "k":
+		if m.createSelRootfs > 0 {
+			m.createSelRootfs--
+		}
+	case "down", "j":
+		if m.createSelRootfs < len(m.createRootfsKeys)-1 {
+			m.createSelRootfs++
+		}
+	case "enter":
+		if len(m.createRootfsKeys) == 0 {
+			m.createError = "No rootfs available"
+			return m, nil
+		}
+		m.createStep = createStepResources
+		m.createError = ""
+		m.createFocusIdx = createFieldCpu
+		m.createInputs[createFieldCpu].Focus()
+		return m, m.createInputs[createFieldCpu].Cursor.BlinkCmd()
+	}
+	return m, nil
+}
+
+// ── Step 3: CPU + Memory inputs ──────────────────────────────────────────────
+
+func (m Model) updateResourceInputs(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "tab", "down":
+		m.createFocusIdx = (m.createFocusIdx + 1) % createFieldCount
+		return m.updateCreateFocus()
+	case "shift+tab", "up":
+		m.createFocusIdx = (m.createFocusIdx - 1 + createFieldCount) % createFieldCount
+		return m.updateCreateFocus()
+	case "enter":
+		if m.createFocusIdx == createFieldCount-1 {
+			return m.submitCreateForm()
+		}
+		m.createFocusIdx++
+		return m.updateCreateFocus()
+	default:
+		// Forward to text input.
+		var cmd tea.Cmd
+		m.createInputs[m.createFocusIdx], cmd = m.createInputs[m.createFocusIdx].Update(msg)
+		return m, cmd
+	}
 }
 
 func (m Model) updateCreateFocus() (Model, tea.Cmd) {
@@ -305,15 +409,29 @@ func (m Model) submitCreateForm() (Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Create the VM
-	created := m.mgr.CreateVm(cpus, memMB)
+	// Resolve selected kernel and rootfs paths.
+	kernelName := m.createKernelKeys[m.createSelKernel]
+	rootfsName := m.createRootfsKeys[m.createSelRootfs]
+	kernelPath := m.mgr.Kernels[kernelName]
+	rootfsPath := m.mgr.Rootfs[rootfsName]
 
-	// Return to normal mode with success message
+	// Create the VM (spawns firecracker process).
+	created, err := m.mgr.CreateVm(cpus, memMB, kernelPath, rootfsPath)
+	if err != nil {
+		m.createError = fmt.Sprintf("create failed: %v", err)
+		return m, nil
+	}
+
+	// Boot the VM (configure + InstanceStart via API).
+	if err := m.mgr.StartVm(created.Id); err != nil {
+		m.createError = fmt.Sprintf("boot failed: %v", err)
+		return m, nil
+	}
+
 	m.mode = modeNormal
-	m.message = fmt.Sprintf("✓ Created %s  (%d vCPU, %d MB, IP: %s, TAP: %s)",
-		created.Id, created.VmCpuCount, created.VmMemSize, created.Ip, created.TapDev)
+	m.message = fmt.Sprintf("✓ Created & booted %s  (%d vCPU, %d MB, kernel: %s, rootfs: %s)",
+		created.Id, cpus, memMB, kernelName, rootfsName)
 	m.messageIsError = false
-
 	return m, nil
 }
 
@@ -331,48 +449,82 @@ func (m Model) executeAction() (Model, tea.Cmd) {
 
 	case "d":
 		if m.mgr.VmCount() > 0 {
-			id, err := m.mgr.DeleteVm(m.selectedVm)
-			if err != nil {
-				m.message = fmt.Sprintf("⚠ %v", err)
-				m.messageIsError = true
-			} else {
-				if m.selectedVm >= m.mgr.VmCount() && m.selectedVm > 0 {
-					m.selectedVm--
-				}
-				m.message = fmt.Sprintf("✓ Deleted %s", id)
-				m.messageIsError = false
+			keys := sortedVmKeys(m.mgr.Vms)
+			if m.selectedVm >= len(keys) {
+				break
 			}
+			selID := keys[m.selectedVm]
+			if err := m.mgr.StopVm(selID); err != nil {
+				// Already stopped is fine — proceed to delete
+				_ = err
+			}
+			delete(m.mgr.Vms, selID)
+			if m.selectedVm >= m.mgr.VmCount() && m.selectedVm > 0 {
+				m.selectedVm--
+			}
+			m.message = fmt.Sprintf("✓ Deleted %s", selID)
+			m.messageIsError = false
 		}
 
 	case "s":
-		err := m.mgr.StartVm(m.selectedVm)
-		if err != nil {
-			m.message = fmt.Sprintf("⚠ %v", err)
+		keys := sortedVmKeys(m.mgr.Vms)
+		if m.selectedVm >= len(keys) {
+			break
+		}
+		selID := keys[m.selectedVm]
+		v := m.mgr.Vms[selID]
+		if v.Status == vm.VmStatusRunning {
+			m.message = fmt.Sprintf("⚠ %s is already running", selID)
 			m.messageIsError = true
 		} else {
-			m.message = fmt.Sprintf("✓ Started %s", m.mgr.Vms[m.selectedVm].Id)
+			v.Status = vm.VmStatusRunning
+			m.message = fmt.Sprintf("✓ Started %s", selID)
 			m.messageIsError = false
 		}
 
 	case "p":
-		err := m.mgr.StopVm(m.selectedVm)
-		if err != nil {
+		keys := sortedVmKeys(m.mgr.Vms)
+		if m.selectedVm >= len(keys) {
+			break
+		}
+		selID := keys[m.selectedVm]
+		if err := m.mgr.PauseVm(selID); err != nil {
 			m.message = fmt.Sprintf("⚠ %v", err)
 			m.messageIsError = true
 		} else {
-			m.message = fmt.Sprintf("✓ Stopped %s", m.mgr.Vms[m.selectedVm].Id)
+			m.message = fmt.Sprintf("✓ Paused %s", selID)
+			m.messageIsError = false
+		}
+
+	case "r":
+		keys := sortedVmKeys(m.mgr.Vms)
+		if m.selectedVm >= len(keys) {
+			break
+		}
+		selID := keys[m.selectedVm]
+		if err := m.mgr.ResumeVm(selID); err != nil {
+			m.message = fmt.Sprintf("⚠ %v", err)
+			m.messageIsError = true
+		} else {
+			m.message = fmt.Sprintf("✓ Resumed %s", selID)
 			m.messageIsError = false
 		}
 
 	case "l":
-		v := m.mgr.Vms[m.selectedVm]
-		m.message = fmt.Sprintf("→ Opening logs for %s (serial: %s)…", v.Id, v.SockPath)
-		m.messageIsError = false
+		keys := sortedVmKeys(m.mgr.Vms)
+		if m.selectedVm < len(keys) {
+			v := m.mgr.Vms[keys[m.selectedVm]]
+			m.message = fmt.Sprintf("→ Opening logs for %s (serial: %s)…", v.Id, v.SockPath)
+			m.messageIsError = false
+		}
 
 	case "x":
-		v := m.mgr.Vms[m.selectedVm]
-		m.message = fmt.Sprintf("→ SSH into %s@%s…", v.Id, v.Ip)
-		m.messageIsError = false
+		keys := sortedVmKeys(m.mgr.Vms)
+		if m.selectedVm < len(keys) {
+			v := m.mgr.Vms[keys[m.selectedVm]]
+			m.message = fmt.Sprintf("→ SSH into %s@%s…", v.Id, v.Ip)
+			m.messageIsError = false
+		}
 	}
 
 	return m, nil
@@ -382,13 +534,17 @@ func (m Model) executeAction() (Model, tea.Cmd) {
 
 func (m Model) View() string {
 	w := m.width
-	if w < 40 {
-		w = 120
+	if w < 60 {
+		w = 60
+	}
+	h := m.height
+	if h < 24 {
+		h = 24
 	}
 
 	var sections []string
 
-	// ── HEADER ──
+	// ── HEADER (2 lines) ──
 	titleText := "  🔥 fcmox"
 	subtitle := "Firecracker VM Manager"
 	spacer := strings.Repeat(" ", max(0, w-lipgloss.Width(titleText)-len(subtitle)-6))
@@ -403,111 +559,129 @@ func (m Model) View() string {
 		BorderLeft(false).
 		BorderRight(false).
 		BorderForeground(colorBorder).
-		Render(titleText + spacer + lipgloss.NewStyle().
-			Foreground(colorTextDim).Render(subtitle) + "  ")
+		Render(titleText + spacer + lipgloss.NewStyle().Foreground(colorTextDim).Render(subtitle) + "  ")
 
 	sections = append(sections, headerBar)
 
-	// ── TOP SECTION: VM TABLE (left) + DETAILS (right) ──
-	tableWidth := (w * 55) / 100
-	detailWidth := w - tableWidth - 3
-	if tableWidth < 40 {
-		tableWidth = 40
-		detailWidth = w - tableWidth - 3
+	// ── HEIGHT BUDGET ──
+	// Total height = h
+	// Header = 2 lines
+	// Bottom Action Panel = roughly 7 lines + 2 borders = 9 lines
+	// Message = 1 line + 1 line spacing = 2 lines
+	// Statusbar = 1 line
+	// Fixed overhead = 14 lines
+	// Top section gets the rest
+	overhead := 14
+	topHeight := h - overhead
+	if topHeight < 10 {
+		topHeight = 10
 	}
 
+	// ── PANEL WIDTHS ──
+	// Left box (Table), Right box (Details/Logs)
+	// Both have left+right borders = 4 columns of borders total.
+	leftInnerW := (w * 50 / 100) - 2
+	rightInnerW := w - leftInnerW - 4
+
+	// Left box height
+	leftInnerH := topHeight
+
+	// Right box has two stacked panels. Each has top+bottom borders = 4 rows of borders.
+	// We want left box total height (leftInnerH + 2) to equal right column total height.
+	// Total right column height = (detailH + 2) + (logsH + 2) = detailH + logsH + 4.
+	// So detailH + logsH = leftInnerH - 2.
+	rightTotalContentH := leftInnerH - 2
+	detailInnerH := rightTotalContentH / 2
+	logsInnerH := rightTotalContentH - detailInnerH
+
+	// ── RENDER TABLE (LEFT) ──
 	tableBorderColor := colorBorder
 	tableTitle := " Virtual Machines "
 	if m.focus == focusVmTable {
-		tableBorderColor = colorBorderHi
+		tableBorderColor = colorBlue
 		tableTitle = " ▸ Virtual Machines "
 	}
 
-	tableContent := m.renderVmTable(tableWidth - 7)
-
+	tableContent := m.renderVmTable(leftInnerW, leftInnerH)
 	tablePanel := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(tableBorderColor).
-		Width(tableWidth).
-		Padding(0, 1).
-		Render(
-			lipgloss.NewStyle().Foreground(colorTeal).Bold(true).Render(tableTitle) + "\n" +
-				tableContent,
-		)
+		Width(leftInnerW).
+		Height(leftInnerH).
+		Render(lipgloss.NewStyle().Foreground(colorCyan).Bold(true).Render(" "+tableTitle+" ") + "\n" + tableContent)
 
-	detailContent := m.renderVmDetail(detailWidth - 4)
-
+	// ── RENDER DETAILS (RIGHT TOP) ──
+	detailContent := m.renderVmDetail(rightInnerW-1, detailInnerH)
 	detailPanel := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(colorBorder).
-		Width(detailWidth).
-		Padding(0, 1).
-		Render(
-			lipgloss.NewStyle().Foreground(colorAmber).Bold(true).Render(" VM Details ") + "\n" +
-				detailContent,
-		)
+		Width(rightInnerW).
+		Height(detailInnerH).
+		Render(lipgloss.NewStyle().Foreground(colorAmber).Bold(true).Render(" VM Details ") + "\n" + detailContent)
 
-	topSection := lipgloss.JoinHorizontal(lipgloss.Top, tablePanel, " ", detailPanel)
+	// ── RENDER LOGS (RIGHT BOTTOM) ──
+	logsContent := m.renderVmLogs(rightInnerW-1, logsInnerH-1) // -1 for title
+	logsPanel := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorBorder).
+		Width(rightInnerW).
+		Height(logsInnerH).
+		Render(lipgloss.NewStyle().Foreground(colorOrange).Bold(true).Render(" VM Logs ") + "\n" + logsContent)
+
+	rightColumn := lipgloss.JoinVertical(lipgloss.Left, detailPanel, logsPanel)
+
+	// Join Top Section
+	topSection := lipgloss.JoinHorizontal(lipgloss.Top, tablePanel, rightColumn)
 	sections = append(sections, topSection)
 
-	// ── SEPARATOR ──
-	sepLeft := lipgloss.NewStyle().Foreground(colorBorder).Render("├")
-	sepLine := lipgloss.NewStyle().Foreground(colorBorder).Render(strings.Repeat("─", w-2))
-	sepRight := lipgloss.NewStyle().Foreground(colorBorder).Render("┤")
-	sections = append(sections, sepLeft+sepLine+sepRight)
-
-	// ── BOTTOM SECTION ──
+	// ── BOTTOM SECTION (Actions/Form) ──
 	if m.mode == modeCreateForm {
-		sections = append(sections, m.renderCreateForm(w-2))
+		sections = append(sections, " "+m.renderCreateForm(w-4))
 	} else {
 		actionsBorderColor := colorBorder
 		actionsTitle := " Actions "
 		if m.focus == focusActions {
-			actionsBorderColor = colorBorderHi
+			actionsBorderColor = colorBlue
 			actionsTitle = " ▸ Actions "
 		}
 
-		actionsContent := m.renderActions(w - 6)
-
+		actionsContent := m.renderActions(w - 4)
 		actionsPanel := lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(actionsBorderColor).
-			Width(w-2).
-			Padding(0, 1).
-			Render(
-				lipgloss.NewStyle().Foreground(colorCyan).Bold(true).Render(actionsTitle) + "\n" +
-					actionsContent,
-			)
+			Width(w - 2).
+			Render(lipgloss.NewStyle().Foreground(colorPurple).Bold(true).Render(" "+actionsTitle+" ") + "\n" + actionsContent)
 
 		sections = append(sections, actionsPanel)
 	}
 
-	// ── Message ──
+	// ── MESSAGE ──
+	msgLine := ""
 	if m.message != "" {
 		msgStyle := lipgloss.NewStyle().Foreground(colorGreen).Bold(true)
 		if m.messageIsError {
 			msgStyle = lipgloss.NewStyle().Foreground(colorRed).Bold(true)
 		}
-		sections = append(sections, "  "+msgStyle.Render(m.message))
+		msgLine = "  " + msgStyle.Render(m.message)
 	}
+	sections = append(sections, msgLine, "")
 
-	// ── Status bar ──
+	// ── STATUS BAR ──
 	var statusHelpText string
 	if m.mode == modeCreateForm {
-		statusHelpText = "  tab/↑↓ switch field  enter submit/next  esc cancel"
+		statusHelpText = "  tab/↑↓ select field  enter next/submit  esc cancel"
 	} else {
-		statusHelpText = "  tab switch  ↑↓ navigate  enter execute  q quit"
+		statusHelpText = "  tab switch panel  ↑↓ select  enter execute  q quit"
 	}
 	statusLeft := lipgloss.NewStyle().Foreground(colorTextDim).Render(statusHelpText)
 	vmCount := fmt.Sprintf("%d VMs ", m.mgr.VmCount())
 	runCount := m.mgr.RunningCount()
-	statusRight := lipgloss.NewStyle().Foreground(colorGreen).Render(
-		fmt.Sprintf("%d running", runCount))
+	statusRight := lipgloss.NewStyle().Foreground(colorGreen).Render(fmt.Sprintf("%d running", runCount))
 	statusMid := lipgloss.NewStyle().Foreground(colorTextDim).Render(" │ ")
 
 	rightBlock := lipgloss.NewStyle().Foreground(colorAmber).Render(vmCount) + statusMid + statusRight + "  "
 	spacerLen := max(0, w-lipgloss.Width(statusLeft)-lipgloss.Width(rightBlock))
-	statusBar := statusLeft + strings.Repeat(" ", spacerLen) + rightBlock
+	statusBar := lipgloss.NewStyle().Background(lipgloss.Color("#1a1a1a")).Render(statusLeft + strings.Repeat(" ", spacerLen) + rightBlock)
 
 	sections = append(sections, statusBar)
 
@@ -517,44 +691,36 @@ func (m Model) View() string {
 // ─── Render: Create Form ─────────────────────────────────────────────────────
 
 func (m Model) renderCreateForm(panelWidth int) string {
-	labelStyle := lipgloss.NewStyle().Foreground(colorAmber).Bold(true).Width(14)
-	inputBorderFocused := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(colorBorderHi).
-		Padding(0, 1).
-		Width(18)
-	inputBorderBlurred := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(colorBorder).
-		Padding(0, 1).
-		Width(18)
-
-	var fields []string
-
-	// CPU field
-	cpuLabel := labelStyle.Render("CPU Cores:")
-	cpuInput := inputBorderBlurred.Render(m.createInputs[createFieldCpu].View())
-	if m.createFocusIdx == createFieldCpu {
-		cpuInput = inputBorderFocused.Render(m.createInputs[createFieldCpu].View())
+	// Step indicator bar
+	steps := []string{"Kernel", "Rootfs", "Resources"}
+	var stepParts []string
+	for i, name := range steps {
+		num := fmt.Sprintf("%d", i+1)
+		if createStep(i) == m.createStep {
+			stepParts = append(stepParts, lipgloss.NewStyle().Foreground(colorCyan).Bold(true).Render("["+num+"] "+name))
+		} else if createStep(i) < m.createStep {
+			stepParts = append(stepParts, lipgloss.NewStyle().Foreground(colorGreen).Render("✓ "+name))
+		} else {
+			stepParts = append(stepParts, lipgloss.NewStyle().Foreground(colorTextDim).Render(num+" "+name))
+		}
 	}
-	cpuHint := lipgloss.NewStyle().Foreground(colorTextDim).Render("  (1-32)")
-	fields = append(fields, "  "+cpuLabel+cpuInput+cpuHint)
+	stepBar := "  " + strings.Join(stepParts, lipgloss.NewStyle().Foreground(colorBorder).Render("  →  "))
 
-	// Memory field
-	memLabel := labelStyle.Render("Memory (MB):")
-	memInput := inputBorderBlurred.Render(m.createInputs[createFieldMem].View())
-	if m.createFocusIdx == createFieldMem {
-		memInput = inputBorderFocused.Render(m.createInputs[createFieldMem].View())
+	var content string
+
+	switch m.createStep {
+	case createStepKernel:
+		content = m.renderListSelector("Select Kernel Image", m.createKernelKeys, m.createSelKernel, panelWidth-8)
+	case createStepRootfs:
+		content = m.renderListSelector("Select Root Filesystem", m.createRootfsKeys, m.createSelRootfs, panelWidth-8)
+	case createStepResources:
+		content = m.renderResourceInputs(panelWidth - 8)
 	}
-	memHint := lipgloss.NewStyle().Foreground(colorTextDim).Render("  (128-32768)")
-	fields = append(fields, "  "+memLabel+memInput+memHint)
 
 	// Error message
 	if m.createError != "" {
-		fields = append(fields, "  "+lipgloss.NewStyle().Foreground(colorRed).Bold(true).Render("⚠ "+m.createError))
+		content += "\n  " + lipgloss.NewStyle().Foreground(colorRed).Bold(true).Render("⚠ "+m.createError)
 	}
-
-	content := strings.Join(fields, "\n")
 
 	return lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
@@ -562,43 +728,114 @@ func (m Model) renderCreateForm(panelWidth int) string {
 		Width(panelWidth).
 		Padding(0, 1).
 		Render(
-			lipgloss.NewStyle().Foreground(colorCyan).Bold(true).Render(" ＋ Create New VM ") + "\n\n" +
+			lipgloss.NewStyle().Foreground(colorCyan).Bold(true).Render(" ＋ Create New VM ") + "\n" +
+				stepBar + "\n\n" +
 				content + "\n",
 		)
 }
 
+// renderListSelector renders a scrollable list with a highlighted cursor.
+func (m Model) renderListSelector(title string, items []string, selected int, maxWidth int) string {
+	titleLine := "  " + lipgloss.NewStyle().Foreground(colorAmber).Bold(true).Render(title)
+
+	if len(items) == 0 {
+		return titleLine + "\n  " + lipgloss.NewStyle().Foreground(colorTextDim).Italic(true).Render("None available")
+	}
+
+	var lines []string
+	lines = append(lines, titleLine)
+
+	for i, item := range items {
+		if i == selected {
+			pointer := lipgloss.NewStyle().Foreground(colorBlue).Bold(true).Render("▸ ")
+			name := lipgloss.NewStyle().Foreground(colorTextBold).Bold(true).Render(truncate(item, maxWidth-4))
+			lines = append(lines, "  "+pointer+name)
+		} else {
+			name := lipgloss.NewStyle().Foreground(colorText).Render(truncate(item, maxWidth-4))
+			lines = append(lines, "    "+name)
+		}
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// renderResourceInputs renders the CPU and Memory text input fields.
+func (m Model) renderResourceInputs(maxWidth int) string {
+	labelStyle := lipgloss.NewStyle().Foreground(colorAmber).Bold(true).Width(14)
+	inputFocused := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorBorderHi).
+		Padding(0, 1).
+		Width(18)
+	inputBlurred := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorBorder).
+		Padding(0, 1).
+		Width(18)
+
+	// Selected kernel + rootfs summary
+	kernelSummary := lipgloss.NewStyle().Foreground(colorTextDim).Render(
+		fmt.Sprintf("  Kernel: %s  |  Rootfs: %s",
+			m.createKernelKeys[m.createSelKernel],
+			m.createRootfsKeys[m.createSelRootfs]))
+
+	var fields []string
+	fields = append(fields, kernelSummary)
+	fields = append(fields, "")
+
+	// CPU
+	cpuLabel := labelStyle.Render("CPU Cores:")
+	cpuInput := inputBlurred.Render(m.createInputs[createFieldCpu].View())
+	if m.createFocusIdx == createFieldCpu {
+		cpuInput = inputFocused.Render(m.createInputs[createFieldCpu].View())
+	}
+	cpuHint := lipgloss.NewStyle().Foreground(colorTextDim).Render("  (1-32)")
+	fields = append(fields, "  "+cpuLabel+cpuInput+cpuHint)
+
+	// Memory
+	memLabel := labelStyle.Render("Memory (MB):")
+	memInput := inputBlurred.Render(m.createInputs[createFieldMem].View())
+	if m.createFocusIdx == createFieldMem {
+		memInput = inputFocused.Render(m.createInputs[createFieldMem].View())
+	}
+	memHint := lipgloss.NewStyle().Foreground(colorTextDim).Render("  (128-32768)")
+	fields = append(fields, "  "+memLabel+memInput+memHint)
+
+	return strings.Join(fields, "\n")
+}
+
 // ─── Render: VM Table ────────────────────────────────────────────────────────
 
-func (m Model) renderVmTable(maxWidth int) string {
+func (m Model) renderVmTable(maxWidth int, maxLines int) string {
 	if m.mgr.VmCount() == 0 {
 		return lipgloss.NewStyle().
 			Foreground(colorTextDim).
 			Italic(true).
-			Padding(1, 2).
-			Render("No virtual machines. Press [C] to create one.")
+			Render("  No virtual machines. Press [C] to create one.")
 	}
 
-	colId := 7
-	colStatus := 12
-	colCpu := 5
-	colMem := 7
-	colIp := 14
-	colTap := 7
+	colId := 8
+	colStatus := 10
+	colCpu := 6
+	colMem := 8
+	colIp := 15
+	colTap := 12
 
 	hdrStyle := lipgloss.NewStyle().Foreground(colorAmber).Bold(true)
-	hdr := hdrStyle.Copy().Width(colId).Render("ID") +
+	hdr := "  " + hdrStyle.Copy().Width(colId).Render("ID") +
 		hdrStyle.Copy().Width(colStatus).Render("STATUS") +
 		hdrStyle.Copy().Width(colCpu).Render("CPU") +
 		hdrStyle.Copy().Width(colMem).Render("MEM") +
 		hdrStyle.Copy().Width(colIp).Render("IP") +
 		hdrStyle.Copy().Width(colTap).Render("TAP")
 
-	divider := lipgloss.NewStyle().Foreground(colorBorder).
-		Render(strings.Repeat("─", colId+colStatus+colCpu+colMem+colIp+colTap))
+	divider := "  " + lipgloss.NewStyle().Foreground(colorBorder).
+		Render(strings.Repeat("─", colId+colStatus+colCpu+colMem+colIp+colTap-2))
 
 	rows := []string{hdr, divider}
 
-	for i, v := range m.mgr.Vms {
+	for i, key := range sortedVmKeys(m.mgr.Vms) {
+		v := m.mgr.Vms[key]
 		isSelected := i == m.selectedVm
 
 		rowStyle := lipgloss.NewStyle().Foreground(colorText)
@@ -613,19 +850,23 @@ func (m Model) renderVmTable(maxWidth int) string {
 		statusStr := statusColored(v.Status)
 
 		row := prefix +
-			rowStyle.Copy().Width(colId).Render(v.Id) +
+			rowStyle.Copy().Width(colId).Render(truncate(v.Id, colId-1)) +
 			lipgloss.NewStyle().Width(colStatus).Render(statusStr) +
 			rowStyle.Copy().Width(colCpu).Render(fmt.Sprintf("%d", v.VmCpuCount)) +
 			rowStyle.Copy().Width(colMem).Render(fmt.Sprintf("%dM", v.VmMemSize)) +
-			rowStyle.Copy().Width(colIp).Render(v.Ip) +
-			rowStyle.Copy().Width(colTap).Render(v.TapDev)
+			rowStyle.Copy().Width(colIp).Render(truncate(v.Ip, colIp-1)) +
+			rowStyle.Copy().Width(colTap).Render(truncate(v.TapDev, colTap-1))
 
 		if isSelected && m.focus == focusVmTable {
-			padLen := max(0, maxWidth-lipgloss.Width(row))
+			padLen := max(0, maxWidth-lipgloss.Width(row)-2)
 			row = row + strings.Repeat(" ", padLen)
 		}
 
 		rows = append(rows, row)
+		// Stop if we reach maxLines. -1 because we reserve space for one more item or padding.
+		if len(rows) >= maxLines-1 {
+			break
+		}
 	}
 
 	return strings.Join(rows, "\n")
@@ -633,49 +874,110 @@ func (m Model) renderVmTable(maxWidth int) string {
 
 // ─── Render: VM Detail ──────────────────────────────────────────────────────
 
-func (m Model) renderVmDetail(maxWidth int) string {
+func (m Model) renderVmDetail(maxWidth int, maxLines int) string {
+	if m.mgr.VmCount() == 0 {
+		return lipgloss.NewStyle().
+			Foreground(colorTextDim).
+			Italic(true).
+			Render("  Select a VM to view details")
+	}
+
+	v := m.mgr.Vms[sortedVmKeys(m.mgr.Vms)[m.selectedVm]]
+
+	labelStyle := lipgloss.NewStyle().Foreground(colorTeal).Bold(true).Width(10)
+	valueStyle := lipgloss.NewStyle().Foreground(colorText)
+	dimValueStyle := lipgloss.NewStyle().Foreground(colorTextDim)
+
+	// Status badge
+	bracketStyle := lipgloss.NewStyle().Foreground(colorBorder)
+	statusBadge := statusBadgeOutline(v.Status, bracketStyle)
+
+	vmTitle := lipgloss.NewStyle().Foreground(colorTextBold).Bold(true).Render("  " + v.Id)
+
+	lines := []string{
+		vmTitle + "  " + statusBadge,
+		"",
+		"  " + labelStyle.Render("CPU") + valueStyle.Render(fmt.Sprintf("%d vCPU", v.VmCpuCount)),
+		"  " + labelStyle.Render("Memory") + valueStyle.Render(fmt.Sprintf("%d MB", v.VmMemSize)),
+		"  " + labelStyle.Render("IP") + valueStyle.Render(v.Ip),
+		"  " + labelStyle.Render("MAC") + dimValueStyle.Render(v.MacAddr),
+		"  " + labelStyle.Render("TAP") + valueStyle.Render(v.TapDev),
+		"",
+		"  " + lipgloss.NewStyle().Foreground(colorPurple).Bold(true).Render("── Paths ──"),
+		"  " + labelStyle.Render("Kernel") + dimValueStyle.Render(truncate(v.KernelPath, maxWidth-14)),
+		"  " + labelStyle.Render("Rootfs") + dimValueStyle.Render(truncate(v.RootfsPath, maxWidth-14)),
+		"  " + labelStyle.Render("Socket") + dimValueStyle.Render(truncate(v.SockPath, maxWidth-14)),
+		"",
+		"  " + lipgloss.NewStyle().Foreground(colorPurple).Bold(true).Render("── Boot ──"),
+		"  " + dimValueStyle.Render(truncate(v.BootArgs, maxWidth-4)),
+	}
+
+	// Truncate output lines to never overflow the container height
+	if len(lines) > maxLines-1 {
+		lines = lines[:maxLines-1]
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// ─── Render: VM Logs ─────────────────────────────────────────────────────────
+
+// readSelectedVmLogs reads the last N lines from the selected VM's log file.
+func (m Model) readSelectedVmLogs(maxLines int) string {
+	if m.mgr.VmCount() == 0 {
+		return ""
+	}
+	keys := sortedVmKeys(m.mgr.Vms)
+	if m.selectedVm >= len(keys) {
+		return ""
+	}
+	v := m.mgr.Vms[keys[m.selectedVm]]
+	if v.LogPath == "" {
+		return ""
+	}
+
+	data, err := os.ReadFile(v.LogPath)
+	if err != nil {
+		return ""
+	}
+
+	allLines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	start := len(allLines) - maxLines
+	if start < 0 {
+		start = 0
+	}
+	return strings.Join(allLines[start:], "\n")
+}
+
+func (m Model) renderVmLogs(maxWidth int, maxLines int) string {
 	if m.mgr.VmCount() == 0 {
 		return lipgloss.NewStyle().
 			Foreground(colorTextDim).
 			Italic(true).
 			Padding(1, 1).
-			Render("Select a VM to\nview details")
+			Render("No VM selected")
 	}
 
-	v := m.mgr.Vms[m.selectedVm]
-
-	labelStyle := lipgloss.NewStyle().Foreground(colorTeal).Bold(true).Width(12)
-	valueStyle := lipgloss.NewStyle().Foreground(colorText)
-	dimValueStyle := lipgloss.NewStyle().Foreground(colorTextDim)
-
-	// Status badge (outline style)
-	bracketStyle := lipgloss.NewStyle().Foreground(colorBorder)
-	statusBadge := statusBadgeOutline(v.Status, bracketStyle)
-
-	vmTitle := lipgloss.NewStyle().
-		Foreground(colorTextBold).
-		Bold(true).
-		Render(v.Id)
-
-	lines := []string{
-		vmTitle + "  " + statusBadge,
-		"",
-		labelStyle.Render("CPU") + valueStyle.Render(fmt.Sprintf("%d vCPU", v.VmCpuCount)),
-		labelStyle.Render("Memory") + valueStyle.Render(fmt.Sprintf("%d MB", v.VmMemSize)),
-		labelStyle.Render("IP") + valueStyle.Render(v.Ip),
-		labelStyle.Render("MAC") + dimValueStyle.Render(v.MacAddr),
-		labelStyle.Render("TAP") + valueStyle.Render(v.TapDev),
-		"",
-		lipgloss.NewStyle().Foreground(colorPurple).Bold(true).Render("─── Paths ───"),
-		labelStyle.Render("Kernel") + dimValueStyle.Render(truncate(v.KernelPath, maxWidth-14)),
-		labelStyle.Render("Rootfs") + dimValueStyle.Render(truncate(v.RootfsPath, maxWidth-14)),
-		labelStyle.Render("Socket") + dimValueStyle.Render(truncate(v.SockPath, maxWidth-14)),
-		"",
-		lipgloss.NewStyle().Foreground(colorPurple).Bold(true).Render("─── Boot ────"),
-		dimValueStyle.Render(truncate(v.BootArgs, maxWidth-2)),
+	if m.vmLogCache == "" {
+		return lipgloss.NewStyle().
+			Foreground(colorTextDim).
+			Italic(true).
+			Render("  No log output yet…")
 	}
 
-	return strings.Join(lines, "\n")
+	// Truncate each line to fit the panel width, and limit total lines.
+	logLines := strings.Split(m.vmLogCache, "\n")
+	if len(logLines) > maxLines {
+		logLines = logLines[len(logLines)-maxLines:]
+	}
+	var truncated []string
+	for _, line := range logLines {
+		truncated = append(truncated, "  "+truncate(line, maxWidth-3))
+	}
+
+	return lipgloss.NewStyle().
+		Foreground(colorTextDim).
+		Render(strings.Join(truncated, "\n"))
 }
 
 // ─── Render: Actions ─────────────────────────────────────────────────────────
@@ -727,6 +1029,39 @@ func (m Model) renderActions(maxWidth int) string {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+// sortedVmKeys returns map keys sorted alphabetically for stable iteration.
+func sortedVmKeys(vms map[string]*vm.Vm) []string {
+	keys := make([]string, 0, len(vms))
+	for k := range vms {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// sortedKeys returns sorted keys of a generic string map.
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// firstKey returns the first (alphabetically) key in a string map, or "".
+func firstKey(m map[string]string) string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	if len(keys) == 0 {
+		return ""
+	}
+	sort.Strings(keys)
+	return keys[0]
+}
 
 func statusColored(s vm.VmStatus) string {
 	switch s {
