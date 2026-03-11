@@ -7,7 +7,7 @@ set -euo pipefail
 KERNEL_SRC="../linux.git"
 
 ROOTFS_SIZE_MB=4096
-ROOTFS_IMAGE="debian.ext4"
+ROOTFS_IMAGE="debian-ebpf.ext4"
 BUILD_DIR=".firecracker-build-$(date +%s)"
 MOUNT_POINT="${BUILD_DIR}/mount"
 DOCKER_IMAGE_NAME="fc-debian-builder"
