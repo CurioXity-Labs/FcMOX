@@ -40,6 +40,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     iproute2 \
     openssh-server \
     procps \
+    vim \
     util-linux && \
     apt-get clean
 

@@ -1,339 +1,379 @@
 package sandbox
 
 import (
-	"context"
+	"bytes"
+	"encoding/json"
 	"fmt"
-	"log"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"sync"
+	"io"
+	"net/http"
 	"time"
 )
 
-// Manager orchestrates the lifecycle of all Firecracker MicroVMs.
+// Manager is a thin HTTP client that delegates all VM operations to fcmox's REST API.
 type Manager struct {
-	vms    map[int]*VM
-	mu     sync.RWMutex
-	Config Config
+	baseURL string
+	client  *http.Client
+}
+
+// Config holds the fcmox API connection settings.
+type Config struct {
+	BaseURL string
 }
 
 func NewManager(cfg Config) *Manager {
 	return &Manager{
-		vms:    make(map[int]*VM),
-		Config: cfg,
+		baseURL: cfg.BaseURL,
+		client: &http.Client{
+			Timeout: 120 * time.Second, // generous for long ops like package install
+		},
 	}
 }
 
-func (m *Manager) rootfsPath(id int) string {
-	return filepath.Join(m.Config.RootFSDir, fmt.Sprintf("rootfs-vm%d.ext4", id))
-}
+// ── HTTP helpers ─────────────────────────────────────────────────────────────
 
-// Create registers a new VM and prepares its sparse rootfs copy.
-func (m *Manager) Create(id, vcpus, memMiB int) (*VM, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if _, exists := m.vms[id]; exists {
-		return nil, fmt.Errorf("vm %d already exists", id)
-	}
-
-	rootfs := m.rootfsPath(id)
-	if _, err := os.Stat(rootfs); os.IsNotExist(err) {
-		log.Printf("[vm %d] creating sparse rootfs copy -> %s", id, rootfs)
-		cmd := exec.Command("cp", "--sparse=always", m.Config.MasterRootFS, rootfs)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return nil, fmt.Errorf("sparse copy: %s: %w", string(out), err)
+func (m *Manager) doJSON(method, path string, body any) ([]byte, int, error) {
+	var reqBody io.Reader
+	if body != nil {
+		data, err := json.Marshal(body)
+		if err != nil {
+			return nil, 0, fmt.Errorf("marshal: %w", err)
 		}
+		reqBody = bytes.NewReader(data)
 	}
 
-	vm := &VM{
-		ID:     id,
+	req, err := http.NewRequest(method, m.baseURL+path, reqBody)
+	if err != nil {
+		return nil, 0, fmt.Errorf("build request: %w", err)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	resp, err := m.client.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("request %s %s: %w", method, path, err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, resp.StatusCode, fmt.Errorf("read response: %w", err)
+	}
+
+	return respBody, resp.StatusCode, nil
+}
+
+func (m *Manager) get(path string) ([]byte, error) {
+	data, status, err := m.doJSON(http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	if status >= 300 {
+		return nil, parseAPIError(data, status)
+	}
+	return data, nil
+}
+
+func (m *Manager) post(path string, body any) ([]byte, error) {
+	data, status, err := m.doJSON(http.MethodPost, path, body)
+	if err != nil {
+		return nil, err
+	}
+	if status >= 300 {
+		return nil, parseAPIError(data, status)
+	}
+	return data, nil
+}
+
+func (m *Manager) put(path string, body any) ([]byte, error) {
+	data, status, err := m.doJSON(http.MethodPut, path, body)
+	if err != nil {
+		return nil, err
+	}
+	if status >= 300 {
+		return nil, parseAPIError(data, status)
+	}
+	return data, nil
+}
+
+func (m *Manager) delete(path string) ([]byte, error) {
+	data, status, err := m.doJSON(http.MethodDelete, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	if status >= 300 {
+		return nil, parseAPIError(data, status)
+	}
+	return data, nil
+}
+
+func parseAPIError(data []byte, status int) error {
+	var errResp struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(data, &errResp) == nil && errResp.Error != "" {
+		return fmt.Errorf("api error (%d): %s", status, errResp.Error)
+	}
+	return fmt.Errorf("api error (%d): %s", status, string(data))
+}
+
+// ── VM Lifecycle ─────────────────────────────────────────────────────────────
+
+type CreateRequest struct {
+	VCPUs    int   `json:"vcpus"`
+	MemMiB   int   `json:"mem_mib"`
+	DiskSize int64 `json:"disk_size,omitempty"`
+}
+
+func (m *Manager) Create(vcpus, memMiB int) (*VMInfo, error) {
+	data, err := m.post("/api/v1/vms", CreateRequest{
 		VCPUs:  vcpus,
 		MemMiB: memMiB,
-		State:  StateStopped,
-		Socket: SocketPath(id),
-		TapDev: fmt.Sprintf("tap%d", id),
-		MAC:    MacForID(id),
-		IP:     IPForID(id),
-		RootFS: rootfs,
-	}
-	m.vms[id] = vm
-	log.Printf("[vm %d] created: vcpus=%d mem=%dMiB mac=%s ip=%s", id, vcpus, memMiB, vm.MAC, vm.IP)
-	return vm, nil
-}
-
-// Get returns a VM by ID.
-func (m *Manager) Get(id int) (*VM, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	vm, ok := m.vms[id]
-	if !ok {
-		return nil, fmt.Errorf("vm %d not found", id)
-	}
-	return vm, nil
-}
-
-// List returns info for all registered VMs.
-func (m *Manager) List() []VMInfo {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	out := make([]VMInfo, 0, len(m.vms))
-	for _, vm := range m.vms {
-		out = append(out, vm.Info())
-	}
-	return out
-}
-
-// Start launches the Firecracker process, configures it via API, and boots the guest.
-func (m *Manager) Start(id int) error {
-	vm, err := m.Get(id)
+	})
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	vm.Mu.Lock()
-	if vm.State == StateRunning || vm.State == StateStarting {
-		vm.Mu.Unlock()
-		return fmt.Errorf("vm %d is already %s", id, vm.State)
+	var info VMInfo
+	if err := json.Unmarshal(data, &info); err != nil {
+		return nil, fmt.Errorf("decode vm info: %w", err)
 	}
-	vm.State = StateStarting
-	vm.Mu.Unlock()
+	return &info, nil
+}
 
-	// Cleanup stale socket
-	os.Remove(vm.Socket)
-
-	// Resolve absolute paths for Firecracker API
-	kernelAbs, _ := filepath.Abs(m.Config.KernelPath)
-	rootfsAbs, _ := filepath.Abs(vm.RootFS)
-
-	// Create the TAP interface natively
-	if err := setupNetwork(vm.TapDev, vm.MAC); err != nil {
-		vm.Mu.Lock()
-		vm.State = StateStopped
-		vm.Mu.Unlock()
-		return fmt.Errorf("setup network: %w", err)
-	}
-
-	// Create a log file for the Firecracker process
-	logPath := fmt.Sprintf("/tmp/fc-vm%d.log", id)
-	logFile, err := os.Create(logPath)
+func (m *Manager) Get(id string) (*VMInfo, error) {
+	data, err := m.get(fmt.Sprintf("/api/v1/vms/%s", id))
 	if err != nil {
-		vm.Mu.Lock()
-		vm.State = StateStopped
-		vm.Mu.Unlock()
-		return fmt.Errorf("create log file: %w", err)
+		return nil, err
 	}
-
-	// Start Firecracker process
-	cmd := exec.Command(m.Config.FirecrackerBin, "--api-sock", vm.Socket)
-	cmd.Env = os.Environ()
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
-
-	if err := cmd.Start(); err != nil {
-		vm.Mu.Lock()
-		vm.State = StateStopped
-		vm.Mu.Unlock()
-		return fmt.Errorf("start firecracker: %w", err)
+	var info VMInfo
+	if err := json.Unmarshal(data, &info); err != nil {
+		return nil, fmt.Errorf("decode vm info: %w", err)
 	}
-
-	vm.Mu.Lock()
-	vm.Cmd = cmd
-	vm.Mu.Unlock()
-
-	log.Printf("[vm %d] firecracker started pid=%d", id, cmd.Process.Pid)
-
-	// Configure via API in background
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		fc := NewFCClient(vm.Socket)
-		if err := fc.WaitForSocket(ctx); err != nil {
-			log.Printf("[vm %d] socket wait failed: %v", id, err)
-			m.markStopped(vm)
-			return
-		}
-
-		bootArgs := m.Config.BootArgs
-		if bootArgs == "" {
-			bootArgs = fmt.Sprintf("console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/sbin/init systemd.unit=multi-user.target quiet lpj=4000000 fc_ip=%s", vm.IP)
-		}
-
-		steps := []struct {
-			name string
-			fn   func() error
-		}{
-			{"machine-config", func() error { return fc.SetMachineConfig(vm.VCPUs, vm.MemMiB) }},
-			{"root-drive", func() error { return fc.SetRootDrive(rootfsAbs) }},
-			{"boot-source", func() error { return fc.SetBootSource(kernelAbs, bootArgs) }},
-			{"network", func() error { return fc.SetNetworkInterface(vm.MAC, vm.TapDev) }},
-			{"instance-start", func() error { return fc.StartInstance() }},
-		}
-
-		for _, step := range steps {
-			if err := step.fn(); err != nil {
-				log.Printf("[vm %d] config step '%s' failed: %v", id, step.name, err)
-				if vm.Cmd != nil && vm.Cmd.Process != nil {
-					_ = vm.Cmd.Process.Kill()
-					_ = vm.Cmd.Wait()
-				}
-				m.markStopped(vm)
-				return
-			}
-		}
-
-		vm.Mu.Lock()
-		vm.State = StateRunning
-		vm.Mu.Unlock()
-		log.Printf("[vm %d] instance started successfully", id)
-	}()
-
-	// Wait for process exit in background
-	go func() {
-		_ = cmd.Wait()
-		log.Printf("[vm %d] firecracker process exited", id)
-		m.markStopped(vm)
-	}()
-
-	return nil
+	return &info, nil
 }
 
-// Stop sends Ctrl+Alt+Del then kills the Firecracker process.
-func (m *Manager) Stop(id int) error {
-	vm, err := m.Get(id)
+func (m *Manager) List() ([]VMInfo, error) {
+	data, err := m.get("/api/v1/vms")
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	vm.Mu.Lock()
-	if vm.State != StateRunning && vm.State != StateStarting {
-		vm.Mu.Unlock()
-		return fmt.Errorf("vm %d is not running (state=%s)", id, vm.State)
+	var vms []VMInfo
+	if err := json.Unmarshal(data, &vms); err != nil {
+		return nil, fmt.Errorf("decode vm list: %w", err)
 	}
-	vm.State = StateStopping
-	vm.Mu.Unlock()
-
-	// Try graceful shutdown first
-	fc := NewFCClient(vm.Socket)
-	_ = fc.SendCtrlAltDel()
-
-	// Give it 3 seconds, then force kill
-	go func() {
-		time.Sleep(3 * time.Second)
-		vm.Mu.Lock()
-		defer vm.Mu.Unlock()
-		if vm.State == StateStopping && vm.Cmd != nil && vm.Cmd.Process != nil {
-			log.Printf("[vm %d] force killing pid=%d", id, vm.Cmd.Process.Pid)
-			_ = vm.Cmd.Process.Kill()
-		}
-	}()
-
-	return nil
+	return vms, nil
 }
 
-// Destroy stops a VM and removes its rootfs.
-func (m *Manager) Destroy(id int) error {
-	vm, err := m.Get(id)
+func (m *Manager) Stop(id string) error {
+	_, err := m.post(fmt.Sprintf("/api/v1/vms/%s/stop", id), nil)
+	return err
+}
+
+func (m *Manager) Destroy(id string) error {
+	_, err := m.delete(fmt.Sprintf("/api/v1/vms/%s", id))
+	return err
+}
+
+// ── Wait Ready ───────────────────────────────────────────────────────────────
+
+type WaitRequest struct {
+	TimeoutSeconds int `json:"timeout_seconds"`
+}
+
+type WaitResponse struct {
+	Ready bool   `json:"ready"`
+	VMID  string `json:"vm_id"`
+	IP    string `json:"ip"`
+}
+
+func (m *Manager) WaitUntilReady(id string, timeoutSec int) (*WaitResponse, error) {
+	data, err := m.post(fmt.Sprintf("/api/v1/vms/%s/wait", id), WaitRequest{
+		TimeoutSeconds: timeoutSec,
+	})
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	// Stop if running
-	vm.Mu.Lock()
-	running := vm.State == StateRunning || vm.State == StateStarting
-	vm.Mu.Unlock()
-	if running {
-		if err := m.Stop(id); err != nil {
-			return err
-		}
-		// Wait for it to die
-		for i := 0; i < 50; i++ {
-			vm.Mu.Lock()
-			stopped := vm.State == StateStopped
-			vm.Mu.Unlock()
-			if stopped {
-				break
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
+	var resp WaitResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("decode wait response: %w", err)
 	}
-
-	// Remove rootfs
-	if err := os.Remove(vm.RootFS); err != nil && !os.IsNotExist(err) {
-		log.Printf("[vm %d] warning: could not remove rootfs: %v", id, err)
-	}
-
-	cleanupNetwork(vm.TapDev)
-
-	m.mu.Lock()
-	delete(m.vms, id)
-	m.mu.Unlock()
-
-	log.Printf("[vm %d] destroyed", id)
-	return nil
+	return &resp, nil
 }
 
-// WaitUntilReady blocks until VM is running and SSH is reachable, or timeout.
-func (m *Manager) WaitUntilReady(id int, timeout time.Duration) error {
-	vm, err := m.Get(id)
+// ── SSH Operations ───────────────────────────────────────────────────────────
+
+type ExecRequest struct {
+	Command        string `json:"command"`
+	TimeoutSeconds int    `json:"timeout_seconds"`
+}
+
+func (m *Manager) Exec(id, command string, timeoutSec int) (*CommandResult, error) {
+	data, err := m.post(fmt.Sprintf("/api/v1/vms/%s/exec", id), ExecRequest{
+		Command:        command,
+		TimeoutSeconds: timeoutSec,
+	})
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		vm.Mu.Lock()
-		state := vm.State
-		vm.Mu.Unlock()
-
-		if state == StateRunning {
-			// Try SSH connection
-			if err := SSHCheck(vm.IP, m.Config.SSHUser, m.Config.SSHPassword); err == nil {
-				return nil
-			}
-		}
-		time.Sleep(500 * time.Millisecond)
+	var result CommandResult
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("decode exec result: %w", err)
 	}
-	return fmt.Errorf("vm %d did not become ready within %v", id, timeout)
+	return &result, nil
 }
 
-// markStopped cleans up after a Firecracker process exits.
-func (m *Manager) markStopped(vm *VM) {
-	vm.Mu.Lock()
-	defer vm.Mu.Unlock()
-	vm.State = StateStopped
-	os.Remove(vm.Socket)
-	cleanupNetwork(vm.TapDev)
+type ScriptRequest struct {
+	Script         string `json:"script"`
+	Interpreter    string `json:"interpreter"`
+	TimeoutSeconds int    `json:"timeout_seconds"`
 }
 
-// setupNetwork creates the TAP device and attaches it to the fc-br0 bridge.
-func setupNetwork(tapDev, mac string) error {
-	bridge := "fc-br0"
-
-	// Cleanup old junk natively
-	_ = exec.Command("ip", "tuntap", "del", "dev", tapDev, "mode", "tap").Run()
-
-	commands := [][]string{
-		{"ip", "tuntap", "add", "dev", tapDev, "mode", "tap"},
-		{"ip", "link", "set", tapDev, "address", mac},
-		{"ip", "link", "set", tapDev, "master", bridge},
-		{"ip", "link", "set", tapDev, "up"},
+func (m *Manager) RunScript(id string, script, interpreter string, timeoutSec int) (*CommandResult, error) {
+	data, err := m.post(fmt.Sprintf("/api/v1/vms/%s/script", id), ScriptRequest{
+		Script:         script,
+		Interpreter:    interpreter,
+		TimeoutSeconds: timeoutSec,
+	})
+	if err != nil {
+		return nil, err
 	}
-
-	for _, cmdArgs := range commands {
-		if out, err := exec.Command(cmdArgs[0], cmdArgs[1:]...).CombinedOutput(); err != nil {
-			return fmt.Errorf("network setup failed (%v): %s: %w", cmdArgs, string(out), err)
-		}
+	var result CommandResult
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("decode script result: %w", err)
 	}
-	return nil
+	return &result, nil
 }
 
-// cleanupNetwork removes a TAP device.
-func cleanupNetwork(tapDev string) {
-	if tapDev == "" {
-		return
+type PackagesRequest struct {
+	Packages []string `json:"packages"`
+}
+
+func (m *Manager) InstallPackages(id string, packages []string) (*CommandResult, error) {
+	data, err := m.post(fmt.Sprintf("/api/v1/vms/%s/packages", id), PackagesRequest{
+		Packages: packages,
+	})
+	if err != nil {
+		return nil, err
 	}
-	_ = exec.Command("ip", "link", "del", tapDev).Run()
+	var result CommandResult
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("decode packages result: %w", err)
+	}
+	return &result, nil
+}
+
+// ── File Operations ──────────────────────────────────────────────────────────
+
+type UploadRequest struct {
+	RemotePath string `json:"remote_path"`
+	Content    string `json:"content"`
+	IsBase64   bool   `json:"base64"`
+}
+
+type UploadResponse struct {
+	Status     string `json:"status"`
+	RemotePath string `json:"remote_path"`
+	Size       int    `json:"size"`
+}
+
+func (m *Manager) UploadFile(id, remotePath, content string, isBase64 bool) (*UploadResponse, error) {
+	data, err := m.put(fmt.Sprintf("/api/v1/vms/%s/files", id), UploadRequest{
+		RemotePath: remotePath,
+		Content:    content,
+		IsBase64:   isBase64,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var resp UploadResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("decode upload response: %w", err)
+	}
+	return &resp, nil
+}
+
+type DownloadResponse struct {
+	RemotePath string `json:"remote_path"`
+	Content    string `json:"content"`
+	Size       int    `json:"size"`
+}
+
+func (m *Manager) DownloadFile(id, remotePath string) (*DownloadResponse, error) {
+	data, err := m.get(fmt.Sprintf("/api/v1/vms/%s/files?path=%s", id, remotePath))
+	if err != nil {
+		return nil, err
+	}
+	var resp DownloadResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("decode download response: %w", err)
+	}
+	return &resp, nil
+}
+
+// ── Process / Network / Service ──────────────────────────────────────────────
+
+func (m *Manager) ListProcesses(id string) (*CommandResult, error) {
+	data, err := m.get(fmt.Sprintf("/api/v1/vms/%s/processes", id))
+	if err != nil {
+		return nil, err
+	}
+	var result CommandResult
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("decode processes: %w", err)
+	}
+	return &result, nil
+}
+
+func (m *Manager) NetworkStatus(id string) (*CommandResult, error) {
+	data, err := m.get(fmt.Sprintf("/api/v1/vms/%s/network", id))
+	if err != nil {
+		return nil, err
+	}
+	var result CommandResult
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("decode network: %w", err)
+	}
+	return &result, nil
+}
+
+type ServiceRequest struct {
+	Service string `json:"service"`
+	Action  string `json:"action"`
+}
+
+func (m *Manager) ManageService(id, service, action string) (*CommandResult, error) {
+	data, err := m.post(fmt.Sprintf("/api/v1/vms/%s/service", id), ServiceRequest{
+		Service: service,
+		Action:  action,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var result CommandResult
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("decode service result: %w", err)
+	}
+	return &result, nil
+}
+
+// ── Cluster Info ─────────────────────────────────────────────────────────────
+
+type ClusterInfo struct {
+	Bridge  string   `json:"bridge"`
+	Gateway string   `json:"gateway"`
+	Network string   `json:"network"`
+	VMCount int      `json:"vm_count"`
+	VMs     []VMInfo `json:"vms"`
+}
+
+func (m *Manager) ClusterInfo() (*ClusterInfo, error) {
+	data, err := m.get("/api/v1/cluster")
+	if err != nil {
+		return nil, err
+	}
+	var info ClusterInfo
+	if err := json.Unmarshal(data, &info); err != nil {
+		return nil, fmt.Errorf("decode cluster info: %w", err)
+	}
+	return &info, nil
 }

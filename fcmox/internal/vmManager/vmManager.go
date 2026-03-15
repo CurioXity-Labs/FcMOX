@@ -2,14 +2,11 @@ package vmmanager
 
 import (
 	"fmt"
-	"log/slog"
 	"os"
 	"os/exec"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 type VmStatus string
@@ -52,10 +49,12 @@ type VmManager struct {
 }
 
 type Vm struct {
-	VmCpuCount     int
 	PID            int
+	VmCpuCount     int
 	VmMemSize      int
+	DiskSize       int
 	Id             string
+	Name           string
 	KernelPath     string
 	RootfsPath     string
 	TapDev         string
@@ -87,12 +86,13 @@ func NewVmManager(rootfsPath string, kernelImagesPath string, firecrackerBinPath
 
 // CreateVm allocates a new VM record, spawns a dedicated firecracker process
 // for it (listening on its own Unix socket), and returns the Vm.
-func (mgr *VmManager) CreateVm(cpus int, memMB int, kernelPath string, rootfsPath string) (*Vm, error) {
+func (mgr *VmManager) CreateVm(cpus int, memMB int, kernelPath string, rootfsPath string, diskSize int64) (*Vm, error) {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
 
-	id := mgr.nextVMID()
-	idx := mgr.nextIdx - 1 // nextVMID already incremented nextIdx
+	_ = diskSize // TODO: implement disk resizing optimally
+
+	id, idx := mgr.nextVMID()
 
 	tapName, tapMAC, tapOk := createTap(id)
 	if !tapOk {
@@ -104,6 +104,11 @@ func (mgr *VmManager) CreateVm(cpus int, memMB int, kernelPath string, rootfsPat
 	if out, err := exec.Command("cp", "--reflink=auto", rootfsPath, vmRootfs).CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("copy rootfs for %s: %s: %w", id, string(out), err)
 	}
+
+	// vmRootfs, err := copyAndResizeImage(rootfsPath, fmt.Sprintf("/tmp/rootfs-%s.ext4", id), diskSize)
+	// if err != nil {
+	// 	return nil, fmt.Errorf("copy rootfs for %s: %w", id, err)
+	// }
 
 	ip := fmt.Sprintf("172.16.0.%d", idx+1)
 	vm := &Vm{
@@ -161,6 +166,7 @@ func (mgr *VmManager) StopVm(id string) error {
 	os.Remove(vm.LogPath)
 	os.Remove(vm.RootfsPath) // per-VM rootfs copy
 	vm.Status = VmStatusStopped
+	delete(mgr.Vms, id)
 	return nil
 }
 
@@ -322,12 +328,13 @@ func (mgr *VmManager) GetKernelByName(name string) (string, bool) {
 	return val, ok
 }
 
-func (mgr *VmManager) nextVMID() string {
-
-	id := fmt.Sprintf("vm-%d", mgr.nextIdx)
-	mgr.nextIdx++
-
-	return id
+func (mgr *VmManager) nextVMID() (string, int) {
+	for i := 1; ; i++ {
+		id := fmt.Sprintf("vm-%d", i)
+		if _, exists := mgr.Vms[id]; !exists {
+			return id, i
+		}
+	}
 }
 
 // loadExistingKernels scans path for vmlinux* files and fills kernels map
@@ -373,60 +380,4 @@ func loadExistingRootFs(path string, rootfs map[string]string) {
 	if len(rootfs) == 0 {
 		fmt.Printf("No rootfs found in %s\n", path)
 	}
-}
-
-func createTap(vmID string) (string, string, bool) {
-	u := uuid.NewMD5(uuid.NameSpaceDNS, []byte(vmID))
-	b := u[:]
-
-	// Use first 6 bytes of UUID, force LAA bit
-	mac := fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x",
-		(b[0]|2)&0xfe, b[1], b[2], b[3], b[4], b[5])
-
-	tapName := fmt.Sprintf("tap-%s", vmID)
-	bridge := "fc-br0"
-
-	// 1. Cleanup old junk (Idempotency)
-	_ = exec.Command("ip", "tuntap", "del", "dev", tapName, "mode", "tap").Run()
-
-	// 2. Commands defined as a slice for cleaner execution
-	commands := [][]string{
-		{"ip", "tuntap", "add", "dev", tapName, "mode", "tap"},
-		{"ip", "link", "set", tapName, "address", mac}, // Set MAC on Host side too
-		{"ip", "link", "set", tapName, "master", bridge},
-		{"ip", "link", "set", tapName, "up"},
-	}
-
-	for _, cmdArgs := range commands {
-		if out, err := exec.Command(cmdArgs[0], cmdArgs[1:]...).CombinedOutput(); err != nil {
-			slog.Error("Network setup failed", "cmd", cmdArgs, "out", string(out), "err", err)
-			return "", "", false
-		}
-	}
-
-	return tapName, mac, true
-}
-
-// deleteTap removes a TAP device. Best-effort; errors are logged but not fatal.
-func deleteTap(tapName string) {
-	if tapName == "" {
-		return
-	}
-	if out, err := exec.Command("ip", "link", "del", tapName).CombinedOutput(); err != nil {
-		slog.Warn("failed to delete TAP", "tap", tapName, "err", err, "output", string(out))
-	}
-}
-
-// Cleanup stops all running VMs, removing their TAP devices, firecracker
-// processes, and sockets. Call this on application shutdown.
-func (mgr *VmManager) Cleanup() {
-	slog.Info("cleaning up all VMs...")
-	for id, vm := range mgr.Vms {
-		if vm.Status != VmStatusStopped {
-			if err := mgr.StopVm(id); err != nil {
-				slog.Warn("cleanup: failed to stop VM", "id", id, "err", err)
-			}
-		}
-	}
-	slog.Info("all VMs cleaned up")
 }

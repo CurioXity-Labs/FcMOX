@@ -4,8 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 
-	"mcp-sandbox/sandbox"
+	"mcp-sandbox-server/sandbox"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -15,18 +16,14 @@ func RegisterVMTools(server *mcp.Server, mgr *sandbox.Manager) {
 
 	// ── sandbox_create_vm ────────────────────────────────────────────────
 	type createArgs struct {
-		ID     int `json:"id"      jsonschema:"Unique VM ID (1-254)"`
 		VCPUs  int `json:"vcpus"   jsonschema:"Number of vCPUs (default 2)"`
 		MemMiB int `json:"mem_mib" jsonschema:"Memory in MiB (default 1024)"`
 	}
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "sandbox_create_vm",
-		Description: "Create a new Firecracker microVM sandbox. This allocates an ID, clones the root filesystem, and prepares the VM for booting. The VM is not started yet — call sandbox_start_vm next.",
+		Description: "Create and boot a new Firecracker microVM sandbox. Allocates a VM with dedicated rootfs, configures it, and starts it. Returns the VM info including its ID and IP address.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args createArgs) (*mcp.CallToolResult, any, error) {
-		if args.ID < 1 || args.ID > 254 {
-			return errorResult("id must be between 1 and 254"), nil, nil
-		}
 		if args.VCPUs < 1 {
 			args.VCPUs = 2
 		}
@@ -34,39 +31,26 @@ func RegisterVMTools(server *mcp.Server, mgr *sandbox.Manager) {
 			args.MemMiB = 1024
 		}
 
-		vm, err := mgr.Create(args.ID, args.VCPUs, args.MemMiB)
+		vm, err := mgr.Create(args.VCPUs, args.MemMiB)
 		if err != nil {
 			return errorResult(err.Error()), nil, nil
 		}
-		return jsonResult("VM created successfully", vm.Info()), nil, nil
-	})
-
-	// ── sandbox_start_vm ─────────────────────────────────────────────────
-	type vmIDArgs struct {
-		VMID int `json:"vm_id" jsonschema:"ID of the target VM"`
-	}
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "sandbox_start_vm",
-		Description: "Boot a created microVM. This launches the Firecracker process, configures resources via its API, and starts the guest kernel. The VM will be assigned an IP on the 172.16.0.0/24 network. SSH becomes available once the guest finishes booting.",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args vmIDArgs) (*mcp.CallToolResult, any, error) {
-		if err := mgr.Start(args.VMID); err != nil {
-			return errorResult(err.Error()), nil, nil
-		}
-		vm, _ := mgr.Get(args.VMID)
-		info := vm.Info()
-		return jsonResult(fmt.Sprintf("VM %d is starting. IP will be %s. SSH will be available once boot completes.", args.VMID, info.IP), info), nil, nil
+		return jsonResult("VM created and starting", vm), nil, nil
 	})
 
 	// ── sandbox_stop_vm ──────────────────────────────────────────────────
+	type vmIDArgs struct {
+		VMID string `json:"vm_id" jsonschema:"ID of the target VM (e.g. vm-1)"`
+	}
+
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "sandbox_stop_vm",
-		Description: "Gracefully stop a running microVM. Sends Ctrl+Alt+Del and waits 3 seconds for clean shutdown before force-killing.",
+		Description: "Gracefully stop a running microVM. Kills the Firecracker process and cleans up resources.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args vmIDArgs) (*mcp.CallToolResult, any, error) {
 		if err := mgr.Stop(args.VMID); err != nil {
 			return errorResult(err.Error()), nil, nil
 		}
-		return textResult(fmt.Sprintf("VM %d is stopping.", args.VMID)), nil, nil
+		return textResult(fmt.Sprintf("VM %s stopped.", args.VMID)), nil, nil
 	})
 
 	// ── sandbox_destroy_vm ───────────────────────────────────────────────
@@ -77,7 +61,7 @@ func RegisterVMTools(server *mcp.Server, mgr *sandbox.Manager) {
 		if err := mgr.Destroy(args.VMID); err != nil {
 			return errorResult(err.Error()), nil, nil
 		}
-		return textResult(fmt.Sprintf("VM %d destroyed.", args.VMID)), nil, nil
+		return textResult(fmt.Sprintf("VM %s destroyed.", args.VMID)), nil, nil
 	})
 
 	// ── sandbox_list_vms ─────────────────────────────────────────────────
@@ -85,7 +69,10 @@ func RegisterVMTools(server *mcp.Server, mgr *sandbox.Manager) {
 		Name:        "sandbox_list_vms",
 		Description: "List all registered microVMs with their current state, IP address, resource allocation, and PID.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, _ any) (*mcp.CallToolResult, any, error) {
-		vms := mgr.List()
+		vms, err := mgr.List()
+		if err != nil {
+			return errorResult(err.Error()), nil, nil
+		}
 		if len(vms) == 0 {
 			return textResult("No VMs registered. Use sandbox_create_vm to create one."), nil, nil
 		}
@@ -101,7 +88,7 @@ func RegisterVMTools(server *mcp.Server, mgr *sandbox.Manager) {
 		if err != nil {
 			return errorResult(err.Error()), nil, nil
 		}
-		return jsonResult("", vm.Info()), nil, nil
+		return jsonResult("", vm), nil, nil
 	})
 }
 
@@ -135,4 +122,13 @@ func jsonResult(prefix string, data interface{}) *mcp.CallToolResult {
 			&mcp.TextContent{Text: text},
 		},
 	}
+}
+
+// parseVMID attempts to parse a VM ID as an int (for back-compat with old tools
+// that used numeric IDs); falls back to string.
+func parseVMID(raw string) string {
+	if _, err := strconv.Atoi(raw); err == nil {
+		return "vm-" + raw
+	}
+	return raw
 }

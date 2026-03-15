@@ -416,7 +416,7 @@ func (m Model) submitCreateForm() (Model, tea.Cmd) {
 	rootfsPath := m.mgr.Rootfs[rootfsName]
 
 	// Create the VM (spawns firecracker process).
-	created, err := m.mgr.CreateVm(cpus, memMB, kernelPath, rootfsPath)
+	created, err := m.mgr.CreateVm(cpus, memMB, kernelPath, rootfsPath, 0)
 	if err != nil {
 		m.createError = fmt.Sprintf("create failed: %v", err)
 		return m, nil
@@ -458,7 +458,6 @@ func (m Model) executeAction() (Model, tea.Cmd) {
 				// Already stopped is fine — proceed to delete
 				_ = err
 			}
-			delete(m.mgr.Vms, selID)
 			if m.selectedVm >= m.mgr.VmCount() && m.selectedVm > 0 {
 				m.selectedVm--
 			}

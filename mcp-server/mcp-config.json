@@ -1,15 +1,9 @@
 {
   "mcpServers": {
     "sandbox": {
-      "command": "sudo",
+      "command": "/home/n/firecracker/mcp-server/mcp-server",
       "args": [
-        "/home/satyam/personal_workspace/AI-Sandboxing-with-microvm/latest-firecracker-ebpf/mcp-server/mcp-sandbox",
-        "--firecracker=/home/satyam/personal_workspace/AI-Sandboxing-with-microvm/latest-firecracker-ebpf/firecracker",
-        "--kernel=/home/satyam/personal_workspace/AI-Sandboxing-with-microvm/latest-firecracker-ebpf/lk-images/vmlinux-6.12-ebpf",
-        "--rootfs=/home/satyam/personal_workspace/AI-Sandboxing-with-microvm/latest-firecracker-ebpf/lk-rootfs/debian.ext4",
-        "--rootfs-dir=/home/satyam/personal_workspace/AI-Sandboxing-with-microvm/latest-firecracker-ebpf",
-        "--ssh-user=root",
-        "--ssh-password=root"
+        "--fcmox-url=http://localhost:8090"
       ]
     }
   }

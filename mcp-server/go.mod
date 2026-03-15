@@ -1,11 +1,8 @@
-module mcp-sandbox
+module mcp-sandbox-server
 
 go 1.25.0
 
-require (
-	github.com/modelcontextprotocol/go-sdk v1.4.1
-	golang.org/x/crypto v0.49.0
-)
+require github.com/modelcontextprotocol/go-sdk v1.4.1
 
 require (
 	github.com/google/jsonschema-go v0.4.2 // indirect

@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"fcmox/internal/rest"
+	"fcmox/internal/ssh"
 	"fcmox/internal/tui"
 	vm "fcmox/internal/vmManager"
 )
@@ -16,11 +18,17 @@ import (
 var (
 	LinuxImagesPath string
 	RootfsPath      string
+	APIAddr         string
+	SSHUser         string
+	SSHPassword     string
 )
 
 func main() {
 	flag.StringVar(&RootfsPath, "rootfs-path", "/home/n/firecracker/lk-rootfs", "Path to rootfs directory")
 	flag.StringVar(&LinuxImagesPath, "linux-images-path", "lk-images", "Path to Linux images directory")
+	flag.StringVar(&APIAddr, "api-addr", ":8090", "REST API listen address")
+	flag.StringVar(&SSHUser, "ssh-user", "root", "SSH username for guest VMs")
+	flag.StringVar(&SSHPassword, "ssh-password", "root", "SSH password for guest VMs")
 	flag.Parse()
 
 	err := initialCleanup()
@@ -59,6 +67,17 @@ func main() {
 		LinuxImagesAbsPath,
 		fcBinPath,
 	)
+
+	// Start REST API server in the background
+	apiServer := rest.NewServer(mgr, ssh.Config{
+		User:     SSHUser,
+		Password: SSHPassword,
+	}, APIAddr)
+	go func() {
+		if err := apiServer.Start(); err != nil {
+			log.Printf("REST API server error: %v", err)
+		}
+	}()
 
 	err = tui.Run(mgr)
 	if err != nil {
